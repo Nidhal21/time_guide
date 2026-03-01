@@ -1,0 +1,156 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Space+Grotesk:wght@500;600;700&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 210 20% 98%;
+    --foreground: 220 25% 10%;
+
+    --card: 0 0% 100%;
+    --card-foreground: 220 25% 10%;
+
+    --popover: 0 0% 100%;
+    --popover-foreground: 220 25% 10%;
+
+    --primary: 24 95% 53%;
+    --primary-foreground: 0 0% 100%;
+
+    --secondary: 214 84% 56%;
+    --secondary-foreground: 0 0% 100%;
+
+    --muted: 210 15% 93%;
+    --muted-foreground: 220 10% 46%;
+
+    --accent: 24 100% 96%;
+    --accent-foreground: 24 95% 40%;
+
+    --destructive: 0 84% 60%;
+    --destructive-foreground: 0 0% 100%;
+
+    --border: 214 20% 90%;
+    --input: 214 20% 90%;
+    --ring: 24 95% 53%;
+
+    --radius: 0.75rem;
+
+    --chat-user: 24 100% 96%;
+    --chat-user-foreground: 220 25% 10%;
+    --chat-ai: 214 100% 97%;
+    --chat-ai-foreground: 220 25% 10%;
+    --chat-ai-accent: 214 84% 56%;
+
+    --gradient-primary: linear-gradient(135deg, hsl(24, 95%, 53%), hsl(24, 100%, 62%));
+    --gradient-secondary: linear-gradient(135deg, hsl(214, 84%, 56%), hsl(214, 90%, 65%));
+    --gradient-hero: linear-gradient(135deg, hsl(24, 95%, 53%), hsl(214, 84%, 56%));
+    --gradient-surface: linear-gradient(180deg, hsl(210, 20%, 98%), hsl(0, 0%, 100%));
+
+    --shadow-soft: 0 2px 15px -3px hsl(220 25% 10% / 0.08);
+    --shadow-card: 0 4px 25px -5px hsl(220 25% 10% / 0.1);
+    --shadow-elevated: 0 10px 40px -10px hsl(220 25% 10% / 0.15);
+    --shadow-glow-primary: 0 0 30px -5px hsl(24 95% 53% / 0.3);
+    --shadow-glow-secondary: 0 0 30px -5px hsl(214 84% 56% / 0.3);
+
+    --sidebar-background: 0 0% 100%;
+    --sidebar-foreground: 220 25% 10%;
+    --sidebar-primary: 24 95% 53%;
+    --sidebar-primary-foreground: 0 0% 100%;
+    --sidebar-accent: 24 100% 96%;
+    --sidebar-accent-foreground: 24 95% 40%;
+    --sidebar-border: 214 20% 90%;
+    --sidebar-ring: 24 95% 53%;
+  }
+
+  .dark {
+    --background: 222 30% 6%;
+    --foreground: 210 20% 95%;
+    --card: 222 25% 9%;
+    --card-foreground: 210 20% 95%;
+    --popover: 222 25% 9%;
+    --popover-foreground: 210 20% 95%;
+    --primary: 24 95% 53%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 214 84% 56%;
+    --secondary-foreground: 0 0% 100%;
+    --muted: 222 20% 14%;
+    --muted-foreground: 215 15% 55%;
+    --accent: 24 80% 12%;
+    --accent-foreground: 24 95% 70%;
+    --destructive: 0 62% 30%;
+    --destructive-foreground: 210 40% 98%;
+    --border: 222 20% 16%;
+    --input: 222 20% 16%;
+    --ring: 24 95% 53%;
+    --chat-user: 24 60% 10%;
+    --chat-user-foreground: 210 20% 95%;
+    --chat-ai: 214 40% 10%;
+    --chat-ai-foreground: 210 20% 95%;
+    --chat-ai-accent: 214 84% 65%;
+    --sidebar-background: 222 25% 9%;
+    --sidebar-foreground: 210 20% 95%;
+    --sidebar-primary: 24 95% 53%;
+    --sidebar-primary-foreground: 0 0% 100%;
+    --sidebar-accent: 24 80% 12%;
+    --sidebar-accent-foreground: 24 95% 70%;
+    --sidebar-border: 222 20% 16%;
+    --sidebar-ring: 24 95% 53%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground font-sans antialiased;
+    font-family: 'Inter', system-ui, sans-serif;
+  }
+
+  h1, h2, h3, h4, h5, h6 {
+    font-family: 'Space Grotesk', system-ui, sans-serif;
+  }
+}
+
+@layer utilities {
+  .gradient-primary {
+    background: var(--gradient-primary);
+  }
+  .gradient-secondary {
+    background: var(--gradient-secondary);
+  }
+  .gradient-hero {
+    background: var(--gradient-hero);
+  }
+  .shadow-soft {
+    box-shadow: var(--shadow-soft);
+  }
+  .shadow-card {
+    box-shadow: var(--shadow-card);
+  }
+  .shadow-elevated {
+    box-shadow: var(--shadow-elevated);
+  }
+  .shadow-glow-primary {
+    box-shadow: var(--shadow-glow-primary);
+  }
+  .shadow-glow-secondary {
+    box-shadow: var(--shadow-glow-secondary);
+  }
+
+  .chat-scrollbar::-webkit-scrollbar {
+    width: 6px;
+  }
+  .chat-scrollbar::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  .chat-scrollbar::-webkit-scrollbar-thumb {
+    background: hsl(var(--muted-foreground) / 0.2);
+    border-radius: 3px;
+  }
+  .chat-scrollbar::-webkit-scrollbar-thumb:hover {
+    background: hsl(var(--muted-foreground) / 0.4);
+  }
+}
