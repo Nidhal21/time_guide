@@ -25,6 +25,8 @@ Database (PostgreSQL)
 - 🔍 **Recherche avancée** : Trouvez rapidement les cours, salles, professeurs
 - 👥 **Multi-utilisateurs** : Support étudiants et professeurs
 - 🤖 **IA intégrée** : Génération automatique de requêtes SQL
+- 🔐 **Authentification** : Système de login sécurisé
+- 📱 **Interface responsive** : Utilisable sur desktop et mobile
 
 ## Technologies
 
@@ -33,6 +35,7 @@ Database (PostgreSQL)
 - Vite
 - Tailwind CSS
 - shadcn-ui
+- React Router
 
 ### Backend
 - FastAPI
@@ -40,6 +43,7 @@ Database (PostgreSQL)
 - PostgreSQL
 - Transformers (Hugging Face)
 - Qwen2.5-7B-Instruct
+- JWT pour l'authentification
 
 ## Installation
 
@@ -48,15 +52,38 @@ Database (PostgreSQL)
 - Python 3.9+
 - PostgreSQL 14+
 - 16GB RAM minimum (pour le modèle LLM)
+- Git
 
 ### 1. Cloner le projet
 
 ```bash
-git clone <YOUR_GIT_URL>
+git clone https://github.com/Nidhal21/time_guide.git
 cd time-guide-ai-main
 ```
 
-### 2. Configuration Backend
+### 2. Configuration de l'environnement
+
+#### Variables d'environnement
+Créer un fichier `.env` à la racine avec :
+
+```env
+# Base de données
+DATABASE_URL=postgresql://username:password@localhost:5432/emploi_temps_db
+
+# JWT
+JWT_SECRET_KEY=votre_cle_secrete_jwt
+JWT_ALGORITHM=HS256
+JWT_ACCESS_TOKEN_EXPIRE_MINUTES=30
+
+# LLM
+MODEL_PATH=models/Qwen2.5-7B-Instruct
+GROQ_API_KEY=votre_cle_groq
+
+# Autres
+ADMIN_PASSWORD=admin123
+```
+
+### 3. Configuration Backend
 
 ```bash
 # Installer PostgreSQL et créer la base de données
@@ -67,12 +94,13 @@ CREATE DATABASE emploi_temps_db;
 # Initialiser la base de données
 psql -U postgres -d emploi_temps_db -f backend/init_db.sql
 
+# Créer un environnement virtuel Python
+python -m venv .venv
+.venv\Scripts\activate  # Sur Windows
+
 # Installer les dépendances Python
 cd backend
 pip install -r requirements.txt
-
-# Configurer les variables d'environnement
-# Éditer backend/.env avec vos credentials
 
 # Lancer le backend
 uvicorn main:app --reload --port 8000
@@ -83,7 +111,7 @@ Ou utiliser le script de démarrage Windows :
 start_backend.bat
 ```
 
-### 3. Configuration Frontend
+### 4. Configuration Frontend
 
 ```bash
 # Installer les dépendances
@@ -93,25 +121,47 @@ npm install
 npm run dev
 ```
 
+### 5. Utilisation avec Docker (Optionnel)
+
+```bash
+# Construire et lancer les services
+docker-compose up --build
+```
+
 ## Utilisation
 
 ### Pour les Administrateurs
 
-1. Accéder à la page Admin
-2. Uploader un fichier Excel avec l'emploi du temps
-3. Spécifier la classe et la date de version
-4. Le système parse automatiquement et stocke dans la base de données
+1. Accéder à la page Admin (`/admin`)
+2. Se connecter avec les credentials admin
+3. Uploader un fichier Excel avec l'emploi du temps
+4. Spécifier la classe et la date de version
+5. Le système parse automatiquement et stocke dans la base de données
 
 Format Excel requis : Voir [EXCEL_FORMAT.md](backend/EXCEL_FORMAT.md)
 
 ### Pour les Étudiants/Professeurs
 
-1. Accéder au chat
-2. Poser des questions en langage naturel :
+1. Accéder au chat (`/chat`)
+2. Se connecter avec vos credentials
+3. Poser des questions en langage naturel :
    - "Où est Mr BEN SLIMA maintenant ?"
    - "Dans quelle salle j'ai cours maintenant ?"
    - "Quel est mon emploi du temps de demain ?"
    - "Quand est-ce que j'ai cours de TRAIT IMAGES ?"
+
+## Tests
+
+### Backend
+```bash
+cd backend
+pytest tests/
+```
+
+### Frontend
+```bash
+npm test
+```
 
 ## Structure du Projet
 
@@ -120,28 +170,42 @@ time-guide-ai-main/
 ├── backend/
 │   ├── app/
 │   │   ├── models/          # Modèles SQLAlchemy
-│   │   ├── routes/          # Routes API
-│   │   ├── services/        # Services (LLM, Excel, SQL)
+│   │   ├── routes/          # Routes API (chat, admin, auth)
+│   │   ├── services/        # Services (LLM, Excel, SQL, Auth)
 │   │   └── utils/
+│   ├── tests/               # Tests unitaires
 │   ├── main.py              # Point d'entrée FastAPI
 │   ├── requirements.txt     # Dépendances Python
 │   ├── init_db.sql          # Script SQL d'initialisation
 │   └── README.md            # Documentation backend
 ├── src/
-│   ├── components/          # Composants React
-│   ├── pages/               # Pages (Chat, Admin)
-│   └── ...
+│   ├── components/          # Composants React réutilisables
+│   ├── pages/               # Pages principales (Chat, Admin, Auth)
+│   ├── contexts/            # Contextes React (Auth)
+│   ├── hooks/               # Hooks personnalisés
+│   └── lib/                 # Utilitaires
+├── public/                  # Assets statiques
+├── docker-compose.yml       # Configuration Docker
+├── package.json             # Dépendances Node.js
+├── tsconfig.json            # Configuration TypeScript
+├── tailwind.config.ts       # Configuration Tailwind
+├── vite.config.ts           # Configuration Vite
 ├── start_backend.bat        # Script de démarrage Windows
 └── README.md
 ```
 
 ## API Endpoints
 
+### Authentification
+- `POST /api/auth/login` - Connexion utilisateur
+- `POST /api/auth/register` - Inscription (si activé)
+
 ### Chat
 - `POST /api/chat` - Envoyer un message au chatbot
 
 ### Admin
 - `POST /api/admin/upload-emploi` - Uploader un emploi du temps Excel
+- `GET /api/admin/emplois` - Lister les emplois du temps
 
 ### Health
 - `GET /health` - Vérifier l'état du serveur
@@ -201,10 +265,20 @@ uvicorn main:app --reload  # Mode développement avec hot-reload
 - Vérifier le format du fichier (voir EXCEL_FORMAT.md)
 - Vérifier que toutes les colonnes requises sont présentes
 
+## Contribution
+
+1. Fork le projet
+2. Créer une branche feature (`git checkout -b feature/nouvelle-fonction`)
+3. Commit vos changements (`git commit -am 'Ajout nouvelle fonction'`)
+4. Push vers la branche (`git push origin feature/nouvelle-fonction`)
+5. Créer une Pull Request
+
 ## Licence
 
-MIT
+Ce projet est sous licence MIT. Voir le fichier `LICENSE` pour plus de détails.
 
 ## Support
 
-Pour toute question ou problème, ouvrir une issue sur GitHub.
+Pour toute question ou problème :
+- Ouvrir une issue sur GitHub
+- Contacter l'équipe de développement
