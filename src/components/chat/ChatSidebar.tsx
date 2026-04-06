@@ -8,6 +8,7 @@ interface ChatSidebarProps {
   currentMessages: any[];
   onNewChat: () => void;
   onLoadConversation: (messages: any[]) => void;
+  storageKey: string;
 }
 
 interface Conversation {
@@ -17,16 +18,19 @@ interface Conversation {
   messages: any[];
 }
 
-const ChatSidebar = ({ isOpen, onToggle, currentMessages, onNewChat, onLoadConversation }: ChatSidebarProps) => {
+const ChatSidebar = ({ isOpen, onToggle, currentMessages, onNewChat, onLoadConversation, storageKey }: ChatSidebarProps) => {
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const currentConversationIdRef = useRef<string | null>(null);
 
   useEffect(() => {
-    const saved = localStorage.getItem('conversations');
+    currentConversationIdRef.current = null;
+    const saved = localStorage.getItem(storageKey);
     if (saved) {
       setConversations(JSON.parse(saved));
+    } else {
+      setConversations([]);
     }
-  }, []);
+  }, [storageKey]);
 
   useEffect(() => {
     if (currentMessages.length === 0) {
@@ -57,17 +61,17 @@ const ChatSidebar = ({ isOpen, onToggle, currentMessages, onNewChat, onLoadConve
         }
 
         const sliced = next.slice(0, 10);
-        localStorage.setItem('conversations', JSON.stringify(sliced));
+        localStorage.setItem(storageKey, JSON.stringify(sliced));
         return sliced;
       });
     }
-  }, [currentMessages]);
+  }, [currentMessages, storageKey]);
 
   const handleDelete = (id: string, e: React.MouseEvent) => {
     e.stopPropagation();
     const updated = conversations.filter(c => c.id !== id);
     setConversations(updated);
-    localStorage.setItem('conversations', JSON.stringify(updated));
+    localStorage.setItem(storageKey, JSON.stringify(updated));
   };
 
   const handleNewChat = () => {

@@ -1,269 +1,389 @@
-# load_data.py
 from __future__ import annotations
 
 import os
 import re
 from datetime import date
-from typing import Dict, Any, List
+from typing import Any, Dict, List
 
 from sqlalchemy import select
 
 from backend.app.models.db_config import SessionLocal
-from backend.app.services.excel_parser import VerticalExcelParser
 from backend.app.models.database import (
-    Classe, Professeur, Matiere, Salle, Seance, EmploiVersion, Periode, Groupe
+    Classe,
+    EmploiEnseignantSeance,
+    EmploiVersion,
+    Groupe,
+    Matiere,
+    Periode,
+    Professeur,
+    Salle,
+    Seance,
 )
+from backend.app.services.excel_parser import VerticalExcelParser
 
 
-def _norm(s: str) -> str:
-    return re.sub(r"\s+", "", (s or "").strip().lower())
+def _norm(value: str) -> str:
+    return re.sub(r"\s+", "", (value or "").strip().lower())
 
 
-def _norm_periode_name(n: str) -> str:
-    # "P 1" / " p1 " => "P1"
-    n = (n or "").strip().upper()
-    n = re.sub(r"\s+", "", n)
-    return n
+def _norm_periode_name(value: str) -> str:
+    value = (value or "").strip().upper()
+    return re.sub(r"\s+", "", value)
 
 
-def import_emplois_du_temps(excel_file: str, semester_id: int, clear_existing: bool = False):
+def _resolve_type_seance(session: Dict[str, Any]) -> str:
+    session_type = (session.get("type_seance") or "").strip()
+    if session_type in {"TP", "TD", "cours"}:
+        return session_type
+
+    matiere = (session.get("matiere") or "").strip().lower()
+    if matiere.startswith("tp ") or " tp " in matiere or matiere.startswith("tp-"):
+        return "TP"
+    if matiere.startswith("td ") or " td " in matiere or matiere.startswith("td-"):
+        return "TD"
+    return "cours"
+
+
+def _prepare_sessions_for_semester(db, sessions: List[Dict[str, Any]], semester_id: int) -> tuple[List[Dict[str, Any]], Dict[str, Periode]]:
+    periodes = db.query(Periode).filter_by(semestre_id=semester_id).all()
+    if not periodes:
+        raise ValueError(f"Aucune periode n'a ete trouvee pour le semestre S{semester_id}.")
+
+    periodes_by_nom = {_norm_periode_name(periode.nom): periode for periode in periodes if periode.nom}
+    has_p1 = "P1" in periodes_by_nom
+    has_p2 = "P2" in periodes_by_nom
+
+    cleaned_sessions: List[Dict[str, Any]] = []
+    for session in sessions:
+        if not session.get("classe") or not session.get("matiere"):
+            continue
+        if not session.get("jour") or not session.get("heure_debut") or not session.get("heure_fin"):
+            continue
+        cleaned_sessions.append(dict(session))
+
+    expanded_sessions: List[Dict[str, Any]] = []
+    for session in cleaned_sessions:
+        marker = _norm_periode_name(session.get("periode") or "")
+        if marker in {"P1", "P2"}:
+            session_copy = dict(session)
+            session_copy["periode"] = marker
+            expanded_sessions.append(session_copy)
+            continue
+
+        if has_p1 and has_p2:
+            session_p1 = dict(session)
+            session_p1["periode"] = "P1"
+            session_p2 = dict(session)
+            session_p2["periode"] = "P2"
+            expanded_sessions.extend([session_p1, session_p2])
+        else:
+            expanded_sessions.append(dict(session))
+
+    return expanded_sessions, periodes_by_nom
+
+
+def _import_sessions_to_db(
+    sessions: List[Dict[str, Any]],
+    semester_id: int,
+    clear_existing: bool = False,
+    source_label: str = "emploi du temps",
+) -> Dict[str, Any]:
     db = SessionLocal()
     try:
-        print(f"\n{'='*80}")
-        print("IMPORTATION EMPLOIS DU TEMPS")
-        print(f"{'='*80}\n")
+        print(f"\n{'=' * 80}")
+        print(f"IMPORTATION {source_label.upper()}")
+        print(f"{'=' * 80}\n")
 
-        # 0) Load periods for semester
-        periodes = db.query(Periode).filter_by(semestre_id=semester_id).all()
-        if not periodes:
-            print("❌ Périodes non trouvées pour ce semestre!")
-            return
+        prepared_sessions, periodes_by_nom = _prepare_sessions_for_semester(db, sessions, semester_id)
+        print(f"Parsed sessions retained: {len(prepared_sessions)}")
 
-        periodes_by_nom = {_norm_periode_name(p.nom): p for p in periodes if p.nom}
-        has_p1 = "P1" in periodes_by_nom
-        has_p2 = "P2" in periodes_by_nom
-        print(f"📌 Périodes DB: {sorted(periodes_by_nom.keys())}")
+        if not prepared_sessions:
+            print("No valid session to import. Nothing was changed.")
+            return {
+                "semester_id": semester_id,
+                "source": source_label,
+                "parsed_session_count": 0,
+                "imported_session_count": 0,
+                "class_count": 0,
+            }
 
-        # 1) Parse excel
-        parser = VerticalExcelParser()
-        sessions = parser.parse_schedule_file(excel_file)
-        print(f"\n✅ {len(sessions)} séances parsées (brut)\n")
-
-        if not sessions:
-            print("⚠️  Aucune séance parsée: import ignoré (aucune suppression)")
-            return
-
-        # 2) Expand common sessions into both P1 and P2
-        expanded: List[Dict[str, Any]] = []
-        for s in sessions:
-            marker = _norm_periode_name(s.get("periode") or "")
-            if marker in {"P1", "P2"}:
-                s2 = dict(s)
-                s2["periode"] = marker
-                expanded.append(s2)
-            else:
-                if has_p1 and has_p2:
-                    s1 = dict(s); s1["periode"] = "P1"
-                    s2 = dict(s); s2["periode"] = "P2"
-                    expanded.extend([s1, s2])
-                else:
-                    expanded.append(s)
-
-        sessions = expanded
-        print(f"✅ Après expansion P1/P2: {len(sessions)} séances\n")
-
-        def resolve_periode_id(sess: dict) -> int:
-            marker = _norm_periode_name(sess.get("periode") or "")
+        def resolve_periode_id(session: Dict[str, Any]) -> int:
+            marker = _norm_periode_name(session.get("periode") or "")
             if marker in periodes_by_nom:
                 return periodes_by_nom[marker].id
-            return periodes[0].id
+            return next(iter(periodes_by_nom.values())).id
 
-        def resolve_type_seance(sess: dict) -> str:
-            t = (sess.get("type_seance") or "").strip()
-            if t in {"TP", "TD", "cours"}:
-                return t
-            mat = (sess.get("matiere") or "").strip().lower()
-            if mat.startswith("tp ") or " tp " in mat or mat.startswith("tp-"):
-                return "TP"
-            if mat.startswith("td ") or " td " in mat or mat.startswith("td-"):
-                return "TD"
-            return "cours"
-
-        # 3) Ensure classes for this semester
         classes_dict: Dict[str, int] = {}
-        for cls in db.query(Classe).filter_by(semestre_id=semester_id).all():
-            classes_dict[_norm(cls.nom)] = cls.id
+        for classe in db.query(Classe).filter_by(semestre_id=semester_id).all():
+            classes_dict[_norm(classe.nom)] = classe.id
 
-        unique_classes = sorted({_norm(s["classe"]): s["classe"] for s in sessions}.items())
+        unique_classes = sorted({_norm(session["classe"]): session["classe"] for session in prepared_sessions}.items())
         for _, classe_name in unique_classes:
             key = _norm(classe_name)
-            if key not in classes_dict:
-                classe = Classe(nom=classe_name.strip(), semestre_id=semester_id)
-                db.add(classe)
-                db.flush()
-                classes_dict[key] = classe.id
+            if key in classes_dict:
+                continue
+            classe = Classe(nom=classe_name.strip(), semestre_id=semester_id)
+            db.add(classe)
+            db.flush()
+            classes_dict[key] = classe.id
         db.commit()
-        print(f"\n✅ {len(classes_dict)} classes\n")
 
-        # 4) Cleanup (séances + versions) for this semester
+        classe_ids = list(classes_dict.values())
+        classe_ids_sel = select(Classe.id).where(Classe.semestre_id == semester_id)
+
         if clear_existing:
-            print("🧹 Nettoyage (séances + versions) pour ce semestre...")
-
-            # select of class ids for this semester (avoids JOIN/delete errors + avoids SAWarning)
-            classe_ids_sel = select(Classe.id).where(Classe.semestre_id == semester_id)
-
+            print(f"Cleaning previous sessions and versions for semester S{semester_id}...")
             deleted_seances = (
                 db.query(Seance)
                 .filter(Seance.classe_id.in_(classe_ids_sel))
                 .delete(synchronize_session=False)
             )
             db.commit()
-            print(f"  ✓ {deleted_seances} séances supprimées")
+            print(f"  Deleted sessions: {deleted_seances}")
 
-            # Important: delete versions AFTER seances (FK version_id)
             deleted_versions = (
                 db.query(EmploiVersion)
                 .filter(EmploiVersion.classe_id.in_(classe_ids_sel))
                 .delete(synchronize_session=False)
             )
             db.commit()
-            print(f"  ✓ {deleted_versions} versions supprimées")
+            print(f"  Deleted versions: {deleted_versions}")
+        elif classe_ids:
+            (
+                db.query(EmploiVersion)
+                .filter(EmploiVersion.classe_id.in_(classe_ids))
+                .update({"actif": False}, synchronize_session=False)
+            )
+            db.commit()
 
-        # 5) Ensure groups (1 per class by default)
         groupes_dict: Dict[tuple[int, str], int] = {}
-        for g in db.query(Groupe).all():
-            if g.classe_id:
-                groupes_dict[(g.classe_id, _norm(g.nom))] = g.id
+        for groupe in db.query(Groupe).all():
+            if groupe.classe_id:
+                groupes_dict[(groupe.classe_id, _norm(groupe.nom or ""))] = groupe.id
 
-        for sess in sessions:
-            classe_id = classes_dict.get(_norm(sess["classe"]))
+        for session in prepared_sessions:
+            classe_id = classes_dict.get(_norm(session["classe"]))
             if not classe_id:
-                raise ValueError(f"Classe introuvable pour session: {sess['classe']}")
-
-            groupe_nom = (sess.get("groupe") or sess["classe"]).strip()
-            gkey = (classe_id, _norm(groupe_nom))
-            if gkey not in groupes_dict:
-                g = Groupe(nom=groupe_nom, classe_id=classe_id)
-                db.add(g)
-                db.flush()
-                groupes_dict[gkey] = g.id
+                continue
+            groupe_name = (session.get("groupe") or session["classe"]).strip()
+            groupe_key = (classe_id, _norm(groupe_name))
+            if groupe_key in groupes_dict:
+                continue
+            groupe = Groupe(nom=groupe_name, classe_id=classe_id)
+            db.add(groupe)
+            db.flush()
+            groupes_dict[groupe_key] = groupe.id
         db.commit()
-        print("✅ Groupes OK (aucun groupe_id NULL)\n")
 
-        # 6) Professors
-        profs_dict: Dict[str, int] = {_norm(p.nom_complet): p.id for p in db.query(Professeur).all()}
-        unique_profs = sorted({_norm(s["professeur"]): s["professeur"] for s in sessions if s.get("professeur")}.items())
+        profs_dict: Dict[str, int] = {_norm(prof.nom_complet): prof.id for prof in db.query(Professeur).all()}
+        unique_profs = sorted(
+            {_norm(session["professeur"]): session["professeur"] for session in prepared_sessions if session.get("professeur")}.items()
+        )
         for _, prof_name in unique_profs:
             key = _norm(prof_name)
-            if key and key not in profs_dict:
-                prof = Professeur(nom_complet=prof_name.strip())
-                db.add(prof)
-                db.flush()
-                profs_dict[key] = prof.id
+            if not key or key in profs_dict:
+                continue
+            professeur = Professeur(nom_complet=prof_name.strip())
+            db.add(professeur)
+            db.flush()
+            profs_dict[key] = professeur.id
         db.commit()
-        print(f"\n✅ {len(unique_profs)} professeurs\n")
 
-        # 7) Rooms
-        salles_dict: Dict[str, int] = {_norm(s.nom): s.id for s in db.query(Salle).all()}
-        unique_salles = sorted({_norm(s["salle"]): s["salle"] for s in sessions if s.get("salle")}.items())
+        salles_dict: Dict[str, int] = {_norm(salle.nom): salle.id for salle in db.query(Salle).all()}
+        unique_salles = sorted(
+            {_norm(session["salle"]): session["salle"] for session in prepared_sessions if session.get("salle")}.items()
+        )
         for _, salle_name in unique_salles:
             key = _norm(salle_name)
-            if key and key not in salles_dict:
-                salle = Salle(nom=salle_name.strip(), type="Salle")
-                db.add(salle)
-                db.flush()
-                salles_dict[key] = salle.id
-        db.commit()
-        print(f"\n✅ {len(unique_salles)} salles\n")
-
-        # 8) Subjects
-        matieres_dict: Dict[str, int] = {_norm(m.nom): m.id for m in db.query(Matiere).all()}
-        unique_matieres = sorted({_norm(s["matiere"]): s["matiere"] for s in sessions if s.get("matiere")}.items())
-        for _, mat_name in unique_matieres:
-            key = _norm(mat_name)
-            if key and key not in matieres_dict:
-                mat = Matiere(nom=mat_name.strip())
-                db.add(mat)
-                db.flush()
-                matieres_dict[key] = mat.id
-        db.commit()
-        print(f"✅ {len(unique_matieres)} matières\n")
-
-        # 9) Create timetable version PER CLASS
-        versions_by_classe_id: Dict[int, int] = {}
-        for _, classe_id in classes_dict.items():
-            v = EmploiVersion(version_date=date.today(), actif=True, classe_id=classe_id)
-            db.add(v)
+            if not key or key in salles_dict:
+                continue
+            salle = Salle(nom=salle_name.strip(), type="Salle")
+            db.add(salle)
             db.flush()
-            versions_by_classe_id[classe_id] = v.id
+            salles_dict[key] = salle.id
         db.commit()
-        print(f"✅ Versions créées: {len(versions_by_classe_id)}\n")
 
-        # 10) Import sessions
-        print("📋 Importation des séances...")
-        seances_count = 0
+        matieres_dict: Dict[str, int] = {_norm(matiere.nom): matiere.id for matiere in db.query(Matiere).all()}
+        unique_matieres = sorted(
+            {_norm(session["matiere"]): session["matiere"] for session in prepared_sessions if session.get("matiere")}.items()
+        )
+        for _, matiere_name in unique_matieres:
+            key = _norm(matiere_name)
+            if not key or key in matieres_dict:
+                continue
+            matiere = Matiere(nom=matiere_name.strip())
+            db.add(matiere)
+            db.flush()
+            matieres_dict[key] = matiere.id
+        db.commit()
 
-        for sess in sessions:
-            try:
-                classe_id = classes_dict.get(_norm(sess["classe"]))
-                if not classe_id:
-                    raise ValueError(f"Classe introuvable: {sess['classe']}")
+        versions_by_classe_id: Dict[int, int] = {}
+        for classe_id in classe_ids:
+            version = EmploiVersion(version_date=date.today(), actif=True, classe_id=classe_id)
+            db.add(version)
+            db.flush()
+            versions_by_classe_id[classe_id] = version.id
+        db.commit()
 
-                matiere_name = (sess.get("matiere") or "").strip()
-                if not matiere_name:
-                    continue
-
-                groupe_nom = (sess.get("groupe") or sess["classe"]).strip()
-                groupe_key = (classe_id, _norm(groupe_nom))
-                groupe_id = groupes_dict.get(groupe_key)
-                if not groupe_id:
-                    g = Groupe(nom=groupe_nom, classe_id=classe_id)
-                    db.add(g)
-                    db.flush()
-                    groupe_id = g.id
-                    groupes_dict[groupe_key] = groupe_id
-
-                matiere_id = matieres_dict.get(_norm(matiere_name))
-                prof_id = profs_dict.get(_norm(sess.get("professeur", ""))) if sess.get("professeur") else None
-                salle_id = salles_dict.get(_norm(sess.get("salle", ""))) if sess.get("salle") else None
-                periode_id = resolve_periode_id(sess)
-                type_seance = resolve_type_seance(sess)
-                version_id = versions_by_classe_id.get(classe_id)
-
-                seance = Seance(
-                    version_id=version_id,
-                    classe_id=classe_id,
-                    matiere_id=matiere_id,
-                    professeur_id=prof_id,
-                    salle_id=salle_id,
-                    groupe_id=groupe_id,
-                    periode_id=periode_id,
-                    jour=sess["jour"],
-                    heure_debut=sess["heure_debut"],
-                    heure_fin=sess["heure_fin"],
-                    type_seance=type_seance,
-                )
-                db.add(seance)
-                seances_count += 1
-
-                if seances_count % 300 == 0:
-                    db.commit()
-                    print(f"  ... {seances_count} séances")
-
-            except Exception as e:
-                print(f"  ❌ Erreur: {e}")
+        imported_session_count = 0
+        for session in prepared_sessions:
+            classe_id = classes_dict.get(_norm(session["classe"]))
+            if not classe_id:
                 continue
 
-        db.commit()
-        print(f"\n✅ {seances_count} séances importées!\n")
+            matiere_name = (session.get("matiere") or "").strip()
+            if not matiere_name:
+                continue
 
-    except Exception as e:
-        print(f"❌ Erreur générale: {e}")
-        import traceback
-        traceback.print_exc()
+            groupe_name = (session.get("groupe") or session["classe"]).strip()
+            groupe_key = (classe_id, _norm(groupe_name))
+            groupe_id = groupes_dict.get(groupe_key)
+            if not groupe_id:
+                groupe = Groupe(nom=groupe_name, classe_id=classe_id)
+                db.add(groupe)
+                db.flush()
+                groupe_id = groupe.id
+                groupes_dict[groupe_key] = groupe_id
+
+            seance = Seance(
+                version_id=versions_by_classe_id.get(classe_id),
+                classe_id=classe_id,
+                matiere_id=matieres_dict.get(_norm(matiere_name)),
+                professeur_id=profs_dict.get(_norm(session.get("professeur", ""))) if session.get("professeur") else None,
+                salle_id=salles_dict.get(_norm(session.get("salle", ""))) if session.get("salle") else None,
+                groupe_id=groupe_id,
+                periode_id=resolve_periode_id(session),
+                jour=session["jour"],
+                heure_debut=session["heure_debut"],
+                heure_fin=session["heure_fin"],
+                type_seance=_resolve_type_seance(session),
+            )
+            db.add(seance)
+            imported_session_count += 1
+
+            if imported_session_count % 300 == 0:
+                db.commit()
+                print(f"  Imported sessions: {imported_session_count}")
+
+        db.commit()
+        print(f"Import complete: {imported_session_count} sessions inserted.")
+
+        return {
+            "semester_id": semester_id,
+            "source": source_label,
+            "parsed_session_count": len(prepared_sessions),
+            "imported_session_count": imported_session_count,
+            "class_count": len(classes_dict),
+            "version_count": len(versions_by_classe_id),
+        }
+    except Exception:
         db.rollback()
+        raise
     finally:
         db.close()
+
+
+def _sync_teacher_reference_table(
+    sessions: List[Dict[str, Any]],
+    semester_id: int,
+    clear_existing: bool = False,
+    source_file: str | None = None,
+) -> Dict[str, Any]:
+    db = SessionLocal()
+    try:
+        prepared_sessions, periodes_by_nom = _prepare_sessions_for_semester(db, sessions, semester_id)
+
+        if clear_existing:
+            (
+                db.query(EmploiEnseignantSeance)
+                .filter(EmploiEnseignantSeance.semestre_id == semester_id)
+                .delete(synchronize_session=False)
+            )
+            db.commit()
+
+        inserted = 0
+        for session in prepared_sessions:
+            professeur = (session.get("professeur") or "").strip()
+            classe = (session.get("classe") or "").strip()
+            matiere = (session.get("matiere") or "").strip()
+            if not professeur or not classe or not matiere:
+                continue
+
+            periode_name = _norm_periode_name(session.get("periode") or "")
+            if not periode_name:
+                periode_name = next(iter(periodes_by_nom.keys()))
+
+            row = EmploiEnseignantSeance(
+                semestre_id=semester_id,
+                professeur_nom_complet=professeur,
+                classe_nom=classe,
+                matiere_nom=matiere,
+                salle_nom=(session.get("salle") or "").strip() or None,
+                jour=session["jour"],
+                heure_debut=session["heure_debut"],
+                heure_fin=session["heure_fin"],
+                periode_nom=periode_name,
+                type_seance=_resolve_type_seance(session),
+                source_file=source_file,
+            )
+            db.add(row)
+            inserted += 1
+
+            if inserted % 500 == 0:
+                db.commit()
+
+        db.commit()
+        return {
+            "teacher_reference_count": inserted,
+        }
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+def import_emplois_du_temps(excel_file: str, semester_id: int, clear_existing: bool = False) -> Dict[str, Any]:
+    parser = VerticalExcelParser()
+    sessions = parser.parse_schedule_file(excel_file)
+    return _import_sessions_to_db(
+        sessions=sessions,
+        semester_id=semester_id,
+        clear_existing=clear_existing,
+        source_label="emploi du temps etudiants",
+    )
+
+
+def import_teacher_emplois_du_temps(excel_file: str, semester_id: int, clear_existing: bool = False) -> Dict[str, Any]:
+    parser = VerticalExcelParser()
+    sessions = parser.parse_teacher_schedule_file(excel_file)
+    db_summary = _import_sessions_to_db(
+        sessions=sessions,
+        semester_id=semester_id,
+        clear_existing=clear_existing,
+        source_label="emploi du temps enseignants",
+    )
+    reference_summary = _sync_teacher_reference_table(
+        sessions=sessions,
+        semester_id=semester_id,
+        clear_existing=clear_existing,
+        source_file=os.path.basename(excel_file),
+    )
+    return {
+        **db_summary,
+        **reference_summary,
+    }
+
+
+def import_room_emplois_du_temps(excel_file: str, semester_id: int, clear_existing: bool = False) -> Dict[str, Any]:
+    parser = VerticalExcelParser()
+    sessions = parser.parse_room_schedule_file(excel_file)
+    return _import_sessions_to_db(
+        sessions=sessions,
+        semester_id=semester_id,
+        clear_existing=clear_existing,
+        source_label="emploi du temps salles",
+    )
 
 
 def import_all_excels(excel_dir: str = "public/excel_files"):
@@ -271,37 +391,31 @@ def import_all_excels(excel_dir: str = "public/excel_files"):
     if not os.path.isdir(excel_dir):
         raise FileNotFoundError(excel_dir)
 
-    files = [os.path.join(excel_dir, f) for f in os.listdir(excel_dir) if f.lower().endswith(".xlsx")]
+    files = [os.path.join(excel_dir, filename) for filename in os.listdir(excel_dir) if filename.lower().endswith(".xlsx")]
 
     cleared_semesters = set()
     for path in sorted(files):
         base = os.path.basename(path)
-
-        if "etudi" not in base.lower():
-            print(f"⚠️  Type de fichier non supporté pour import seances (ignore): {base}")
-            continue
+        lower_base = base.lower()
 
         semester_id = None
-        if re.search(r"(?:^|[^A-Za-z0-9])S1(?:$|[^A-Za-z0-9])", base, flags=re.IGNORECASE):
+        if re.search(r"(?:^|[^a-z0-9])s1(?:$|[^a-z0-9])", lower_base):
             semester_id = 1
-        elif re.search(r"(?:^|[^A-Za-z0-9])S2(?:$|[^A-Za-z0-9])", base, flags=re.IGNORECASE):
+        elif re.search(r"(?:^|[^a-z0-9])s2(?:$|[^a-z0-9])", lower_base):
             semester_id = 2
-        else:
-            tokens = [t for t in re.split(r"[^A-Za-z0-9]+", base) if t]
-            if any(t.upper() == "S1" for t in tokens):
-                semester_id = 1
-            elif any(t.upper() == "S2" for t in tokens):
-                semester_id = 2
 
         if not semester_id:
-            print(f"⚠️  Semestre non détecté pour: {base} (ignore)")
+            print(f"Semester not detected for {base}. File skipped.")
             continue
 
         clear_existing = semester_id not in cleared_semesters
-        import_emplois_du_temps(path, semester_id=semester_id, clear_existing=clear_existing)
-        cleared_semesters.add(semester_id)
+        if "etudi" in lower_base:
+            import_emplois_du_temps(path, semester_id=semester_id, clear_existing=clear_existing)
+            cleared_semesters.add(semester_id)
+        else:
+            print(f"Unsupported file for seance import: {base}")
 
 
 if __name__ == "__main__":
     import_all_excels("public/excel_files")
-    print("\n\n✨ IMPORTATION TERMINÉE!")
+    print("\nImport finished.")

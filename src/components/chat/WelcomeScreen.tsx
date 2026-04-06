@@ -1,5 +1,5 @@
 import { motion } from "framer-motion";
-import { CalendarDays, Clock, GraduationCap, MapPin } from "lucide-react";
+import { Newspaper, CalendarDays, DoorOpen, BookOpen, GraduationCap } from "lucide-react";
 
 interface WelcomeScreenProps {
   onSuggestionClick: (text: string) => void;
@@ -7,20 +7,20 @@ interface WelcomeScreenProps {
 
 const suggestions = [
   {
+    icon: Newspaper,
+    text: "Quelles sont les dernieres actualites de ENET'Com ?",
+  },
+  {
     icon: CalendarDays,
-    text: "Affiche l'emploi du temps de ma classe aujourd'hui",
+    text: "Quel est l'emploi du temps de ma classe aujourd'hui ?",
   },
   {
-    icon: Clock,
-    text: "Quels sont les cours de demain ?",
+    icon: DoorOpen,
+    text: "Quelles sont les salles disponibles en ce moment ?",
   },
   {
-    icon: GraduationCap,
-    text: "Affiche tous les cours en P1 et P2",
-  },
-  {
-    icon: MapPin,
-    text: "Qui enseigne maintenant en salle C01 ?",
+    icon: BookOpen,
+    text: "Peux-tu me montrer les plans d'etude ?",
   },
 ];
 

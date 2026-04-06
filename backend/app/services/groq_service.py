@@ -1,35 +1,29 @@
-# backend/app/services/groq_service.py
-"""
-Groq API Service for SQL generation + formatting
-
-UPDATED / FIXED (aligned with your latest SQLAgent):
-- Clean ONE-SELECT extraction + comment stripping
-- Stronger "ONLY SELECT" enforcement
-- Prompt updated to:
-    * avoid CASE/EXTRACT(DOW)
-    * avoid forcing periode_id always (SQLAgent now handles smart default + overrides)
-    * include best-practice join for ACTIVE version (SQLAgent also enforces it, but we guide Groq)
-- Safer timeouts + defensive JSON parsing
-- Keeps your behavior: no local fallback formatting for timetable responses (except calendar rows formatting)
-"""
-
 from __future__ import annotations
 
 import os
 import re
-import requests
-from typing import Optional, Any, Dict
+import unicodedata
+from typing import Any, Dict, Optional
 
+import requests
+
+SUSPICIOUS_MOJIBAKE_CHARS = ("Ã", "Â", "â", "€", "™", "œ", "�")
+DAY_DISPLAY_ORDER = {
+    "lundi": 1,
+    "mardi": 2,
+    "mercredi": 3,
+    "jeudi": 4,
+    "vendredi": 5,
+    "samedi": 6,
+    "dimanche": 7,
+}
+FRENCH_DAY_NAMES = tuple(DAY_DISPLAY_ORDER.keys())
 
 class GroqService:
-    """Service for generating SQL using Groq API (Llama 3.3 70B)"""
-
     def __init__(self):
         self.api_key = os.getenv("GROQ_API_KEY")
         self.api_url = "https://api.groq.com/openai/v1/chat/completions"
         self.model = "llama-3.3-70b-versatile"
-
-        # Reuse a session (faster + fewer connection issues)
         self._session = requests.Session()
 
         if not self.api_key:
@@ -37,20 +31,80 @@ class GroqService:
             self.enabled = False
         else:
             self.enabled = True
-            print(f"✓ Groq API initialized with {self.model}")
+            print(f"Groq API initialized with {self.model}")
 
-    # ----------------------------
-    # Helpers
-    # ----------------------------
+    # --- Helpers ---
+
+    def _repair_text_encoding(self, value: str) -> str:
+        if not value:
+            return ""
+
+        repaired = value.replace("\xa0", " ").replace("�", "'").replace("`", "'")
+        if any(ch in repaired for ch in SUSPICIOUS_MOJIBAKE_CHARS):
+            for source_encoding in ("latin1", "cp1252"):
+                try:
+                    candidate = repaired.encode(source_encoding).decode("utf-8")
+                except Exception:
+                    continue
+                if candidate and candidate != repaired:
+                    repaired = candidate
+                    break
+        return repaired
+
+    def _normalize_text(self, text: str) -> str:
+        repaired = self._repair_text_encoding(text or "")
+        normalized = unicodedata.normalize("NFKD", repaired)
+        normalized = "".join(ch for ch in normalized if not unicodedata.combining(ch))
+        normalized = normalized.replace("'", " ")
+        normalized = re.sub(r"[^a-zA-Z0-9\s/-]", " ", normalized)
+        normalized = re.sub(r"\s+", " ", normalized).strip()
+        normalized = normalized.lower()
+        typo_fixes = {
+            "maintement": "maintenant",
+            "maintenent": "maintenant",
+            "disponnible": "disponible",
+            "feriee": "ferie",
+            "feries": "ferie",
+            "lemploi": "emploi",
+            "l emploi": "emploi",
+        }
+        for source, target in typo_fixes.items():
+            normalized = re.sub(rf"\b{re.escape(source)}\b", target, normalized)
+        return normalized
+
+    def _normalize_room_name(self, value: Any) -> str:
+        text = self._repair_text_encoding(str(value or ""))
+        text = re.sub(r"\s+", " ", text).strip().upper()
+        text = re.sub(r"\bC\s+(\d{2})\b", r"C\1", text)
+        text = re.sub(r"\bTEL-TCOM1\b", "TEL-TCOM 1", text)
+        text = re.sub(r"\bEL-CI\s+AUTO\b", "EL-CI AUTO", text)
+        text = re.sub(r"\s*/\s*", " / ", text)
+        return text
+
+    def _room_key(self, value: Any) -> str:
+        normalized = self._normalize_room_name(value).lower()
+        return re.sub(r"[\s/-]+", "", normalized)
+
+    def _extract_requested_day_label(self, question: str) -> Optional[str]:
+        q = self._normalize_text(question)
+        for day_name in FRENCH_DAY_NAMES:
+            if re.search(rf"\b{re.escape(day_name)}\b", q):
+                return day_name
+        if "aujourd" in q:
+            return "aujourd'hui"
+        if "demain" in q:
+            return "demain"
+        if "hier" in q:
+            return "hier"
+        return None
+
     def _is_calendar_question(self, question: str) -> bool:
-        q = (question or "").lower()
+        q = self._normalize_text(question)
         keywords = [
             "vacance",
             "vacances",
-            "jours féri",
-            "jour féri",
             "jour ferie",
-            "fête",
+            "jours ferie",
             "fete",
             "aid",
             "ramadan",
@@ -59,75 +113,48 @@ class GroqService:
             "ds",
             "rattrap",
             "ratt",
-            "révision",
             "revision",
             "calendrier",
-            "calendrier universitaire",
         ]
-        return any(k in q for k in keywords)
+        return any(keyword in q for keyword in keywords)
 
     def _validate_select_only(self, sql: str) -> bool:
         if not sql:
             return False
-        s = sql.replace("```sql", "").replace("```", "").strip()
-        return bool(re.match(r"^\s*select\b", s, re.IGNORECASE))
+        cleaned = sql.replace("```sql", "").replace("```", "").strip()
+        return bool(re.match(r"^\s*select\b", cleaned, re.IGNORECASE))
 
-    def _strip_sql_comments(self, s: str) -> str:
-        """Remove SQL comments: -- line comments and /* block comments */."""
-        if not s:
-            return s
-        s = re.sub(r"/\*[\s\S]*?\*/", " ", s)
-        s = re.sub(r"--[^\n]*", " ", s)
-        return s
+    def _strip_sql_comments(self, sql: str) -> str:
+        if not sql:
+            return sql
+        sql = re.sub(r"/\*[\s\S]*?\*/", " ", sql)
+        sql = re.sub(r"--[^\n]*", " ", sql)
+        return sql
 
-    def _extract_one_select(self, txt: str) -> str:
-        """
-        Extract from the first SELECT to the end, then truncate at the first semicolon.
-        Ensure it ends with ';'.
-        """
-        if not txt:
-            return txt
-
-        # Keep from first SELECT
-        up = txt.upper()
-        idx = up.find("SELECT")
-        if idx >= 0:
-            txt = txt[idx:].strip()
-
-        # Keep only first statement
-        if ";" in txt:
-            txt = txt.split(";", 1)[0].strip()
-
-        txt = re.sub(r"\s+$", "", txt)
-        if not txt.endswith(";"):
-            txt += ";"
-        return txt
-
-    def _clean_sql(self, raw: str) -> str:
-        """
-        Extract a clean ONE-SELECT statement from model output.
-        - removes markdown fences
-        - supports ASK_CLASS / ASK_PROF
-        - keeps from first SELECT
-        - removes extra statements
-        - strips SQL comments
-        - ensures trailing semicolon
-        """
+    def _extract_one_select(self, raw: str) -> str:
         if not raw:
             return raw
+        idx = raw.upper().find("SELECT")
+        if idx >= 0:
+            raw = raw[idx:].strip()
+        if ";" in raw:
+            raw = raw.split(";", 1)[0].strip()
+        if not raw.endswith(";"):
+            raw += ";"
+        return raw
 
-        txt = raw.replace("```sql", "").replace("```", "").strip()
-        txt = txt.replace("\u200b", "").strip()  # remove zero-width spaces
-
-        if re.search(r"\bASK_CLASS\b", txt):
+    def _clean_sql(self, raw: str) -> str:
+        if not raw:
+            return raw
+        text = raw.replace("```sql", "").replace("```", "").strip()
+        text = text.replace("\u200b", "").strip()
+        if re.search(r"\bASK_CLASS\b", text):
             return "ASK_CLASS"
-        if re.search(r"\bASK_PROF\b", txt):
+        if re.search(r"\bASK_PROF\b", text):
             return "ASK_PROF"
-
-        txt = self._strip_sql_comments(txt)
-        txt = re.sub(r"\s+", " ", txt).strip()
-        txt = self._extract_one_select(txt)
-        return txt
+        text = self._strip_sql_comments(text)
+        text = re.sub(r"\s+", " ", text).strip()
+        return self._extract_one_select(text)
 
     def _safe_json(self, response: requests.Response) -> Optional[Dict[str, Any]]:
         try:
@@ -136,77 +163,293 @@ class GroqService:
             print(f"Groq API JSON parse error: {e}")
             return None
 
-    # ----------------------------
-    # Missing info check (optional)
-    # ----------------------------
-    def _extract_class_candidate(self, question: str) -> Optional[str]:
-        q = (question or "").strip()
+    def _extract_room_name(self, question: str) -> Optional[str]:
+        match = re.search(r"\bsalle\s+([A-Za-z0-9][A-Za-z0-9 ]*)\b", question or "", flags=re.IGNORECASE)
+        if not match:
+            return None
+        return self._normalize_room_name(match.group(1))
 
-        m = re.search(
-            r"\b(\d)\s*(ING|TIC|LTIC|MP|MR)\b(?:\s+([A-Z0-9\-]+))?(?:\s+([A-Z0-9\-]+))?(?:\s+(\d))?\b",
-            q,
-            flags=re.IGNORECASE,
-        )
-        if m:
-            parts = [p for p in m.groups() if p]
-            cls = " ".join([parts[0]] + [p.upper() for p in parts[1:]])
-            cls = re.sub(r"\s+", " ", cls).strip()
-            return cls
+    def _format_lookup_response(self, question: str, data: list) -> Optional[str]:
+        if not data:
+            return None
+
+        keys = list(data[0].keys())
+        normalized_keys = {key.lower(): key for key in keys}
+        q = self._normalize_text(question)
+
+        if len(keys) == 1:
+            key = keys[0]
+            values = []
+            for row in data:
+                value = row.get(key)
+                if value is None:
+                    continue
+                value_str = str(value).strip()
+                if value_str and value_str not in values:
+                    values.append(value_str)
+
+            if not values:
+                return None
+
+            if key.lower() in {"nom_complet", "prof", "professeur"}:
+                room_name = self._extract_room_name(question)
+                if "qui enseigne" in q and room_name:
+                    if len(values) == 1:
+                        return f"En salle {room_name}, c'est {values[0]} qui enseigne actuellement."
+                    return f"En salle {room_name}, les enseignants trouves sont : {', '.join(values)}."
+                return values[0] if len(values) == 1 else ", ".join(values)
+
+            if key.lower() in {"total_cours", "count"}:
+                try:
+                    total = int(values[0])
+                except Exception:
+                    return None
+                if total <= 0:
+                    return None
+                if "aujourd" in q:
+                    return f"Oui, ce professeur a {total} cours aujourd'hui."
+                day_label = self._extract_requested_day_label(question)
+                if day_label and day_label not in {"aujourd'hui", "demain", "hier"}:
+                    return f"Oui, ce professeur a {total} cours {day_label}."
+                return f"Oui, ce professeur a {total} cours prevus."
+
+            if key.lower() in {"nom", "room", "salle"}:
+                if any(token in q for token in ["dispon", "libre", "vide"]):
+                    unique_values = []
+                    seen = set()
+                    for value in values:
+                        display_value = self._normalize_room_name(value)
+                        norm = self._room_key(display_value)
+                        if norm in seen:
+                            continue
+                        seen.add(norm)
+                        unique_values.append(display_value)
+                    if not unique_values:
+                        return None
+                    room_label = "salle" if len(unique_values) == 1 else "salles"
+                    if any(token in q for token in ["maintenant", "actuellement", "mtn", "en ce moment"]):
+                        intro = f"Il y a {len(unique_values)} {room_label} disponible{'s' if len(unique_values) > 1 else ''} actuellement :"
+                    else:
+                        day_label = self._extract_requested_day_label(question)
+                        if day_label == "aujourd'hui":
+                            intro = f"Les {room_label} disponible{'s' if len(unique_values) > 1 else ''} aujourd'hui {'sont' if len(unique_values) > 1 else 'est'} :"
+                        elif day_label == "demain":
+                            intro = f"Les {room_label} disponible{'s' if len(unique_values) > 1 else ''} demain {'sont' if len(unique_values) > 1 else 'est'} :"
+                        elif day_label and day_label != "hier":
+                            intro = f"Les {room_label} disponible{'s' if len(unique_values) > 1 else ''} {day_label} {'sont' if len(unique_values) > 1 else 'est'} :"
+                        else:
+                            intro = f"Voici {len(unique_values)} {room_label} disponible{'s' if len(unique_values) > 1 else ''} :"
+                    lines = [intro]
+                    lines.extend(f"- {value}" for value in unique_values[:80])
+                    if len(unique_values) > 80:
+                        lines.append(f"... et {len(unique_values) - 80} autres salles.")
+                    return "\n".join(lines)
+                if "ou se trouve" in q:
+                    if len(values) == 1:
+                        return f"Ce professeur se trouve en salle {self._normalize_room_name(values[0])}."
+                    normalized_values = [self._normalize_room_name(value) for value in values]
+                    return f"Ce professeur se trouve dans plusieurs salles : {', '.join(normalized_values)}."
+                if len(values) == 1:
+                    return f"Salle {self._normalize_room_name(values[0])}."
+                normalized_values = [self._normalize_room_name(value) for value in values]
+                return ", ".join(f"Salle {value}" for value in normalized_values)
+
+            if key.lower() == "classe":
+                if "quelle classe" in q or "dans quelle classe" in q or "pour quelle classe" in q:
+                    if len(values) == 1:
+                        return f"Ce professeur est dans la classe {values[0]}."
+                    return "Ce professeur intervient dans les classes suivantes : " + ", ".join(values) + "."
+                return values[0] if len(values) == 1 else ", ".join(values)
+
+        if {"matiere", "heure_debut", "heure_fin"}.issubset(normalized_keys):
+            first = data[0]
+            matiere = str(first.get(normalized_keys["matiere"]) or "").strip()
+            start = self._format_time(first.get(normalized_keys["heure_debut"]))
+            end = self._format_time(first.get(normalized_keys["heure_fin"]))
+            room_value = first.get(normalized_keys["salle"]) if "salle" in normalized_keys else first.get(normalized_keys["room"], "")
+            room = self._normalize_room_name(room_value) if room_value else ""
+            classe = str(first.get(normalized_keys["classe"]) or "").strip() if "classe" in normalized_keys else ""
+
+            if any(marker in q for marker in ["quel cours", "quelle matiere", "fait il", "enseigne t il", "enseigne maintenant"]):
+                details = [f"{matiere} ({start} - {end})"]
+                if classe:
+                    details.append(f"pour {classe}")
+                if room:
+                    details.append(f"en salle {room}")
+                return "Le cours actuel est " + " ".join(details) + "."
+
+        if {"jour", "heure_debut", "heure_fin"}.issubset(normalized_keys):
+            if (
+                "ou se trouve" in q
+                and "salle" in normalized_keys
+                and "classe" in normalized_keys
+            ):
+                lines = []
+                for row in data:
+                    day = str(row.get(normalized_keys["jour"]) or "").strip()
+                    start = self._format_time(row.get(normalized_keys["heure_debut"]))
+                    end = self._format_time(row.get(normalized_keys["heure_fin"]))
+                    classe = str(row.get(normalized_keys["classe"]) or "").strip()
+                    salle = self._normalize_room_name(row.get(normalized_keys["salle"]))
+                    lines.append(f"- {day} {start}-{end} : {classe} en salle {salle}")
+                if lines:
+                    return "Voici ou se trouve ce professeur :\n" + "\n".join(lines[:12])
+            return None
+
+        if len(data) == 1:
+            row = data[0]
+            parts = [f"{key}: {value}" for key, value in row.items() if value is not None]
+            if parts:
+                return "\n".join(parts)
 
         return None
 
+    def _format_time(self, value: Any) -> str:
+        if value is None:
+            return "?"
+        if hasattr(value, "strftime"):
+            try:
+                return value.strftime("%H:%M")
+            except Exception:
+                pass
+
+        text = str(value).strip()
+        if not text:
+            return "?"
+        match = re.match(r"^(\d{1,2}):(\d{2})", text)
+        if match:
+            return f"{int(match.group(1)):02d}:{match.group(2)}"
+        return text
+
+    def _format_timetable_response(self, data: list) -> Optional[str]:
+        if not data:
+            return None
+        if not {"jour", "heure_debut", "heure_fin"}.issubset(data[0].keys()):
+            return None
+
+        class_names = []
+        grouped: Dict[str, list] = {}
+        seen_entries = set()
+        for row in data:
+            day = str(row.get("jour") or "").strip() or "Jour inconnu"
+            class_name = str(row.get("classe") or "").strip()
+            if class_name and class_name not in class_names:
+                class_names.append(class_name)
+
+            entry = {
+                "time": f"{self._format_time(row.get('heure_debut'))} - {self._format_time(row.get('heure_fin'))}",
+                "matiere": str(row.get("matiere") or "Cours").strip(),
+                "professeur": str(row.get("professeur") or row.get("nom_complet") or "Non precise").strip(),
+                "salle": self._normalize_room_name(row.get("salle") or row.get("room") or "Non precisee"),
+            }
+            dedupe_key = (day, entry["time"], entry["matiere"], entry["professeur"], entry["salle"])
+            if dedupe_key in seen_entries:
+                continue
+            seen_entries.add(dedupe_key)
+
+            grouped.setdefault(day, []).append(
+                entry
+            )
+
+        title = f"Voici votre emploi du temps pour {class_names[0]} :" if len(class_names) == 1 else "Voici votre emploi du temps :"
+        lines = [title]
+        sorted_days = sorted(grouped.keys(), key=lambda day: (DAY_DISPLAY_ORDER.get(day.lower(), 99), day.lower()))
+        for day in sorted_days:
+            entries = sorted(grouped[day], key=lambda entry: entry["time"])
+            lines.extend(["", f"{day} :", ""])
+            for index, entry in enumerate(entries):
+                lines.append(f"{entry['time']} | {entry['matiere']}")
+                lines.append(f"Professeur : {entry['professeur']}")
+                lines.append(f"Salle : {entry['salle']}")
+                if index != len(entries) - 1:
+                    lines.append("")
+        return "\n".join(lines).strip()
+
+    def _post_with_retry(self, payload: dict, timeout: int = 25) -> Optional[requests.Response]:
+        for attempt in range(2):
+            try:
+                return self._session.post(
+                    self.api_url,
+                    headers={"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"},
+                    json=payload,
+                    timeout=timeout,
+                )
+            except (requests.exceptions.ConnectionError, requests.exceptions.ChunkedEncodingError) as e:
+                if attempt == 0:
+                    print(f"Groq connection error (retrying): {e}")
+                    self._session = requests.Session()
+                    continue
+                print(f"Groq API exception: {e}")
+                return None
+            except Exception as e:
+                print(f"Groq API exception: {e}")
+                return None
+        return None
+
+    # --- Missing info check ---
+
+    def _extract_class_candidate(self, question: str) -> Optional[str]:
+        match = re.search(
+            r"\b(\d)\s*(ING|TIC|LTIC|MP|MR)\b(?:\s+([A-Z0-9\-]+))?(?:\s+([A-Z0-9\-]+))?(?:\s+(\d))?\b",
+            (question or "").strip(),
+            flags=re.IGNORECASE,
+        )
+        if not match:
+            return None
+        parts = [part for part in match.groups() if part]
+        return re.sub(r"\s+", " ", " ".join([parts[0]] + [part.upper() for part in parts[1:]])).strip()
+
     def check_missing_info(self, question: str) -> Optional[str]:
-        """
-        Kept for compatibility, but your SQLAgent already does missing-info checks.
-        """
         if self._is_calendar_question(question):
             return None
 
-        q_lower = (question or "").lower()
+        q = self._normalize_text(question)
+        no_class_needed = any(
+            [
+                "professeur" in q,
+                "prof " in q,
+                re.search(r"\b(mr|mme|dr)\b", q),
+                "quelles classes" in q,
+                "liste" in q and "classe" in q,
+                "classes existent" in q,
+                "tous les prof" in q,
+                "liste des prof" in q,
+                "salle" in q and not any(token in q for token in ["cours", "emploi", "seance"]),
+            ]
+        )
+        if no_class_needed:
+            return None
 
         needs_class = any(
             [
-                "emploi du temps" in q_lower,
-                "emplois du temps" in q_lower,
-                "emploi de temps" in q_lower,
-                "edt" in q_lower,
-                "planning" in q_lower,
-                "horaire" in q_lower,
-                "quel cours" in q_lower,
-                "quels cours" in q_lower,
-                "cours" in q_lower,
-                "séance" in q_lower,
-                "seance" in q_lower,
-                "mon cours" in q_lower,
-                "mes cours" in q_lower,
-                "j'ai cours" in q_lower,
-                "demain" in q_lower,
-                "aujourd" in q_lower,
-                "hier" in q_lower,
-                any(d in q_lower for d in ["lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche"]),
+                "emploi du temps" in q,
+                "emplois du temps" in q,
+                "edt" in q,
+                "planning" in q,
+                "horaire" in q,
+                "quel cours" in q,
+                "quels cours" in q,
+                "cours" in q,
+                "seance" in q,
+                "tp" in q.split(),
+                "mon cours" in q,
+                "mes cours" in q,
+                "j ai cours" in q,
+                "demain" in q,
+                "aujourd" in q,
+                "hier" in q,
+                any(day in q for day in ["lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi"]),
             ]
         )
-
         if not needs_class:
             return None
-
-        cls = self._extract_class_candidate(question)
-        if not cls:
+        if not self._extract_class_candidate(question):
             return "Quelle est votre classe ? (ex: 2 ING GII 3, 1 TIC 2, 2 TIC-T, etc.)"
-
         return None
 
-    # ----------------------------
-    # SQL generation (Groq)
-    # ----------------------------
+    # --- SQL generation ---
+
     def generate_sql(self, question: str, context: dict, schema_info: str) -> Optional[str]:
-        """
-        Returns SQL or ASK_* or None.
-        NOTE:
-        - We do NOT force periode_id logic here anymore (SQLAgent does it smarter).
-        - We still allow user explicit P1/P2 in Groq output (SQLAgent enforces too).
-        - We encourage joining active versions, but SQLAgent will enforce anyway.
-        """
         if not self.enabled:
             return None
 
@@ -214,6 +457,7 @@ class GroqService:
         semestre_id = context.get("semestre_id")
         annee_id = context.get("annee_id", 1)
         today_day_name = context.get("jour_actuel") or context.get("jour_nom") or ""
+        resolved_class = self._extract_class_candidate(question) or "MISSING"
 
         prompt = f"""You are a PostgreSQL expert. Return ONLY ONE SQL SELECT query, or ASK_CLASS / ASK_PROF.
 
@@ -221,11 +465,12 @@ DATABASE SCHEMA:
 {schema_info}
 
 CONTEXT:
-- Current Periode ID: {periode_id if periode_id is not None else "NULL"}
-- Current Semestre ID: {semestre_id if semestre_id is not None else "NULL"}
+- Current Periode ID: {periode_id if periode_id is not None else 'NULL'}
+- Current Semestre ID: {semestre_id if semestre_id is not None else 'NULL'}
 - Current Annee ID: {annee_id}
 - Today date: {context.get('date_actuelle', 'unknown')}
-- Today weekday name (French): {today_day_name if today_day_name else "UNKNOWN"}
+- Today weekday name (French): {today_day_name if today_day_name else 'UNKNOWN'}
+- Resolved class from the question: {resolved_class}
 
 USER QUESTION (French):
 {question}
@@ -233,224 +478,124 @@ USER QUESTION (French):
 STRICT RULES:
 A) If the question is about timetable/seances AND the class is missing -> return exactly: ASK_CLASS
 B) If the question is about timetable for a professor AND professor name is missing -> return exactly: ASK_PROF
-
 C) Never output markdown. Never output explanations. ONLY the SQL (or ASK_*).
-D) ALWAYS output ONE SELECT statement. No INSERT/UPDATE/DELETE/DDL. No multiple statements.
-
-E) Class matching MUST normalize spaces:
-   REPLACE(LOWER(c.nom), ' ', '') LIKE '%' || REPLACE(LOWER('<user_class>'), ' ', '') || '%'
-
-F) ACTIVE VERSION RULE (IMPORTANT):
-   For any timetable query on seances, you should use the ACTIVE timetable version:
+D) ALWAYS output ONE SELECT statement. No INSERT/UPDATE/DELETE/DDL.
+E) NEVER use c.id directly to match the class.
+F) If class is available, use:
+   REPLACE(LOWER(c.nom), ' ', '') LIKE '%' || REPLACE(LOWER('{resolved_class}'), ' ', '') || '%'
+G) Active timetable version:
    JOIN emplois_versions v ON v.id = s.version_id AND v.actif = true AND v.classe_id = s.classe_id
-
-G) DAY RULE:
-   - If the user mentions an explicit weekday (lundi/mardi/mercredi/jeudi/vendredi/samedi/dimanche),
-     use that exact value: s.jour = 'Lundi' (etc).
-   - Only if user says "aujourd'hui/demain/hier" and NO explicit weekday is mentioned:
-       * DO NOT use CASE/EXTRACT(DOW).
-       * Prefer using "Today weekday name (French)" when available and set s.jour to that literal.
-       * If Today weekday name is UNKNOWN, then and only then you may use date-based mapping.
-
-H) PERIOD RULE:
-   - If user explicitly mentions P1 or P2 or "P1 et P2" or "complet", DO NOT force current periode_id.
-     Instead JOIN periodes per and filter by:
-        per.semestre_id = {semestre_id if semestre_id is not None else 0}
-        AND per.nom IN ('P1') or ('P2') or ('P1','P2')
-     and use s.periode_id = per.id.
-   - If user does not mention P1/P2, you may omit periode filters entirely (agent will enforce when needed).
-
-I) Rooms:
-   Use alias 'sa' for salles, and use sa.nom for room name.
-
-CALENDAR QUESTIONS:
-- Use vacances_jours_feries (nom, date_debut, date_fin, type, annee_id).
-- If asking for today events:
-  SELECT nom, type, date_debut, date_fin
-  FROM vacances_jours_feries
-  WHERE CURRENT_DATE BETWEEN date_debut AND date_fin
-    AND annee_id = {annee_id}
-  ORDER BY date_debut;
+H) If you filter by day, use LOWER(s.jour) = LOWER('Lundi') style matching.
+I) For rooms, use alias sa and sa.nom.
+J) For calendar questions, use vacances_jours_feries (nom, date_debut, date_fin, type, annee_id).
 
 SQL:"""
 
-        try:
-            response = self._session.post(
-                self.api_url,
-                headers={
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": self.model,
-                    "messages": [
-                        {
-                            "role": "system",
-                            "content": (
-                                "You are a PostgreSQL expert. "
-                                "Return only ONE SELECT query or ASK_CLASS/ASK_PROF. "
-                                "No explanations. No markdown."
-                            ),
-                        },
-                        {"role": "user", "content": prompt},
-                    ],
-                    "temperature": 0.0,
-                    "max_tokens": 700,
-                },
-                timeout=25,
-            )
-
-            if response.status_code != 200:
+        response = self._post_with_retry(
+            {
+                "model": self.model,
+                "messages": [
+                    {"role": "system", "content": "You are a PostgreSQL expert. Return only ONE SELECT query or ASK_CLASS/ASK_PROF. No explanations. No markdown."},
+                    {"role": "user", "content": prompt},
+                ],
+                "temperature": 0.0,
+                "max_tokens": 2000,
+            }
+        )
+        if response is None or response.status_code != 200:
+            if response is not None:
                 print(f"Groq API error: {response.status_code} - {response.text}")
-                return None
-
-            payload = self._safe_json(response)
-            if not payload:
-                return None
-
-            raw = (
-                payload.get("choices", [{}])[0]
-                .get("message", {})
-                .get("content", "")
-            )
-            raw = (raw or "").strip()
-
-            print(f"[DEBUG] Raw SQL from Groq: {raw}")
-
-            sql = self._clean_sql(raw)
-
-            if sql in {"ASK_CLASS", "ASK_PROF"}:
-                return sql
-
-            if not self._validate_select_only(sql):
-                print("[DEBUG] Groq returned non-SELECT.")
-                return None
-
-            print(f"[DEBUG] Cleaned SQL: {sql}")
-            return sql
-
-        except Exception as e:
-            print(f"Groq API exception: {e}")
             return None
 
-    # ----------------------------
-    # Response formatting (NO fallback)
-    # ----------------------------
+        payload = self._safe_json(response)
+        if not payload:
+            return None
+
+        raw = (payload.get("choices", [{}])[0].get("message", {}).get("content", "") or "").strip()
+        print(f"[DEBUG] Raw SQL from Groq: {raw}")
+
+        sql = self._clean_sql(raw)
+        if sql in {"ASK_CLASS", "ASK_PROF"}:
+            return sql
+        if not self._validate_select_only(sql):
+            print("[DEBUG] Groq returned non-SELECT.")
+            return None
+
+        print(f"[DEBUG] Cleaned SQL: {sql}")
+        return sql
+
+    # --- Response formatting ---
+
     def format_response(self, question: str, data: list, context: dict) -> Optional[str]:
-        """
-        No local formatting fallback (per request).
-        Calendar rows -> deterministic local formatting OK.
-        """
+        if not data:
+            return "Aucune donnee trouvee pour cette question."
+
+        if all(("date_debut" in row and "date_fin" in row and ("nom" in row or "Nom" in row)) for row in data):
+            lines = []
+            for row in data[:80]:
+                nom = row.get("nom") or row.get("Nom") or ""
+                event_type = row.get("type") or row.get("Type") or ""
+                date_start = row.get("date_debut") or row.get("DateDebut")
+                date_end = row.get("date_fin") or row.get("DateFin")
+                lines.append(f"{date_start} -> {date_end} | {event_type} | {nom}")
+            return "\n".join(lines).strip()
+
+        lookup_response = self._format_lookup_response(question, data)
+        if lookup_response:
+            return lookup_response
+
+        timetable_response = self._format_timetable_response(data)
+        if timetable_response:
+            return timetable_response
+
         if not self.enabled:
             return None
 
-        if not data:
-            return "Aucune donnée trouvée pour cette question."
-
-        # Calendar rows -> local formatting
-        if all(("date_debut" in r and "date_fin" in r and ("nom" in r or "Nom" in r)) for r in data):
-            lines = []
-            for r in data[:80]:
-                nom = r.get("nom") or r.get("Nom") or ""
-                typ = r.get("type") or r.get("Type") or ""
-                dd = r.get("date_debut") or r.get("DateDebut")
-                df = r.get("date_fin") or r.get("DateFin")
-                lines.append(f"{dd} -> {df} | {typ} | {nom}")
-            return "\n".join(lines).strip()
-
-        data_str = "\n".join([str(dict(row)) for row in data[:25]])
-
-        prompt = f"""You are a professional French university timetable assistant.
+        data_str = "\n".join([str(dict(row)) for row in data[:80]])
+        prompt = f"""You are a professional French university assistant.
 
 USER QUESTION: {question}
-
 ACADEMIC CONTEXT:
-- Semestre: {context.get("semestre")}
-- Periode: {context.get("periode")}
-- Date: {context.get("date_actuelle")}
+- Semestre: {context.get('semestre')}
+- Periode: {context.get('periode')}
+- Date: {context.get('date_actuelle')}
 
 SQL RESULTS ({len(data)} rows):
 {data_str}
 
-FORMAT (plain text, no markdown):
-Voici votre emploi du temps pour 2 ING GII 3 :
+Return plain French text with line breaks and no markdown."""
 
-Lundi :
-
-8:15 - 9:45 | TRAIT IMAGES
-Professeur : Mr BEN SLIMA M.
-Salle : C14
-
-RULES:
-- Always in French
-- Clear blank line between courses
-- No markdown, no bullet points
-- If multiple days, group by day title line (Lundi:, Mardi:, etc.)
-- If multiple periods (P1/P2), group by "P1:" then days, then "P2:".
-
-RESPONSE:"""
-
-        try:
-            response = self._session.post(
-                self.api_url,
-                headers={
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": self.model,
-                    "messages": [
-                        {
-                            "role": "system",
-                            "content": (
-                                "You are a professional French university assistant. "
-                                "Format responses clearly with line breaks. No markdown."
-                            ),
-                        },
-                        {"role": "user", "content": prompt},
-                    ],
-                    "temperature": 0.1,
-                    "max_tokens": 900,
-                },
-                timeout=30,
-            )
-
-            if response.status_code != 200:
+        response = self._post_with_retry(
+            {
+                "model": self.model,
+                "messages": [
+                    {"role": "system", "content": "You are a professional French university assistant. Format responses clearly with line breaks. No markdown."},
+                    {"role": "user", "content": prompt},
+                ],
+                "temperature": 0.1,
+                "max_tokens": 1000,
+            },
+            timeout=30,
+        )
+        if response is None or response.status_code != 200:
+            if response is not None:
                 print(f"Groq format error: {response.status_code} - {response.text}")
-                return None
-
-            payload = self._safe_json(response)
-            if not payload:
-                return None
-
-            raw = (
-                payload.get("choices", [{}])[0]
-                .get("message", {})
-                .get("content", "")
-            )
-            raw = (raw or "").strip()
-            return self._postprocess_response(raw)
-
-        except Exception as e:
-            print(f"Groq format exception: {e}")
             return None
+
+        payload = self._safe_json(response)
+        if not payload:
+            return None
+
+        raw = (payload.get("choices", [{}])[0].get("message", {}).get("content", "") or "").strip()
+        return self._postprocess_response(raw)
 
     def _postprocess_response(self, text: str) -> str:
         if not text:
             return text
-
         text = text.replace("**", "")
-
-        # Ensure blank line before each time range (but not at start)
-        text = re.sub(
-            r"\s*(\d{1,2}:\d{2}\s*-\s*\d{1,2}:\d{2})\s*",
-            r"\n\n\1 ",
-            text,
-        ).strip()
-
+        text = re.sub(r"\s*(\d{1,2}:\d{2}\s*-\s*\d{1,2}:\d{2})\s*", r"\n\n\1 ", text).strip()
         text = re.sub(r"\s+(Professeur\s*:)\s*", r"\n\1 ", text, flags=re.IGNORECASE)
         text = re.sub(r"\s+(Salle\s*:)\s*", r"\n\1 ", text, flags=re.IGNORECASE)
-
         text = re.sub(r"[ \t]+", " ", text)
         text = re.sub(r"\n{3,}", "\n\n", text)
         return text.strip()
