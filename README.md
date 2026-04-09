@@ -1,284 +1,351 @@
-# Chatbot Emploi du Temps Universitaire
+# Time Guide AI
 
-Chatbot intelligent pour la gestion et consultation des emplois du temps universitaires, utilisant le modèle Qwen2.5-7B-Instruct.
+Plateforme web de consultation intelligente des emplois du temps universitaires pour l'ENET'Com.
+
+Le projet combine:
+- un frontend React/Vite,
+- un backend FastAPI,
+- une base PostgreSQL,
+- un moteur d'import Excel,
+- un agent conversationnel oriente SQL,
+- un service d'assistance sur les informations ENET'Com.
+
+## Vue d'ensemble
+
+L'application permet:
+- de poser des questions en langage naturel sur les emplois du temps,
+- de consulter les cours, salles, enseignants et calendrier universitaire,
+- d'importer les emplois du temps via un espace admin,
+- de verifier automatiquement qu'un fichier Excel a ete depose dans la bonne categorie,
+- d'afficher les resultats d'import dans la page admin et en popup notification.
+
+Exemples de questions:
+- `Quel est mon emploi du temps aujourd'hui ?`
+- `Ou se trouve Mr BEN SLIMA maintenant ?`
+- `Qui enseigne en salle C01 ?`
+- `Quelles sont les salles disponibles lundi ?`
+- `Y a-t-il des vacances aujourd'hui ?`
 
 ## Architecture
 
+```text
+Frontend React + Vite
+        |
+        v
+API FastAPI
+        |
+        +--> Authentification
+        +--> Import admin Excel
+        +--> Agent SQL / logique IA
+        +--> Service d'informations ENET'Com
+        |
+        v
+PostgreSQL
 ```
-User
- ↓
-Frontend (React + Vite)
- ↓
-Backend API (FastAPI)
- ↓
-LLM Agent (Qwen2.5-7B-Instruct)
- ↓
-SQL Tool
- ↓
-Database (PostgreSQL)
-```
 
-## Fonctionnalités
+## Fonctionnalites
 
-- 💬 **Chat intelligent** : Posez des questions en langage naturel
-- 📊 **Import Excel** : Upload des emplois du temps depuis des fichiers Excel
-- 🔍 **Recherche avancée** : Trouvez rapidement les cours, salles, professeurs
-- 👥 **Multi-utilisateurs** : Support étudiants et professeurs
-- 🤖 **IA intégrée** : Génération automatique de requêtes SQL
-- 🔐 **Authentification** : Système de login sécurisé
-- 📱 **Interface responsive** : Utilisable sur desktop et mobile
+### Utilisateur
+- connexion et inscription,
+- interface chat moderne,
+- historique recent de conversation,
+- consultation de l'emploi du temps,
+- recherche de professeurs,
+- recherche de salles disponibles,
+- consultation du calendrier universitaire,
+- questions generales sur ENET'Com.
 
-## Technologies
+### Administrateur
+- acces protege a l'espace admin,
+- import de:
+  - `student_s1`
+  - `student_s2`
+  - `teachers_s1`
+  - `teachers_s2`
+  - `rooms_s1`
+  - `rooms_s2`
+  - `calendar`
+- detection automatique du type de workbook,
+- detection des incoherences de semestre,
+- resultats d'import visibles dans la page,
+- notifications popup de succes et d'erreur.
+
+## Stack technique
 
 ### Frontend
-- React + TypeScript
+- React 18
+- TypeScript
 - Vite
+- React Router DOM
 - Tailwind CSS
-- shadcn-ui
-- React Router
+- shadcn/ui
+- Radix UI
+- Framer Motion
+- Sonner
+- Lucide React
+- TanStack Query
+- Vitest
 
 ### Backend
 - FastAPI
+- Uvicorn
 - SQLAlchemy
+- Psycopg
+- Pandas
+- OpenPyXL
+- Requests
+- Python Dotenv
+- Pydantic
+
+### IA et traitement intelligent
+- Groq API
+- modele configure dans le code: `llama-3.3-70b-versatile`
+- logique metier specialisee dans `sql_agent.py`
+
+### Base de donnees
 - PostgreSQL
-- Transformers (Hugging Face)
-- Qwen2.5-7B-Instruct
-- JWT pour l'authentification
+
+## Structure du projet
+
+```text
+time-guide-ai-main/
+|-- backend/
+|   |-- app/
+|   |   |-- models/
+|   |   |-- routes/
+|   |   `-- services/
+|   |-- tests/
+|   |-- uploads/
+|   |-- main.py
+|   `-- requirements.txt
+|-- src/
+|   |-- components/
+|   |-- contexts/
+|   |-- hooks/
+|   |-- lib/
+|   `-- pages/
+|-- load_data.py
+|-- import_calendar.py
+|-- docker-compose.yml
+|-- package.json
+`-- README.md
+```
+
+## Modules importants
+
+### Frontend
+- `src/pages/Chat.tsx`: interface de conversation
+- `src/pages/Admin.tsx`: gestion des imports admin
+- `src/pages/Auth.tsx`: connexion et inscription
+- `src/contexts/AuthContext.tsx`: gestion de session cote client
+
+### Backend
+- `backend/main.py`: point d'entree FastAPI
+- `backend/app/routes/chat.py`: endpoint `/api/chat`
+- `backend/app/routes/auth.py`: endpoints d'authentification
+- `backend/app/routes/admin.py`: endpoints admin
+- `backend/app/services/sql_agent.py`: moteur principal des reponses
+- `backend/app/services/groq_service.py`: communication avec Groq
+- `backend/app/services/admin_import_service.py`: logique d'import admin
+- `backend/app/services/excel_parser.py`: parsing des fichiers Excel
+- `backend/app/services/university_info_service.py`: infos ENET'Com
+- `load_data.py`: injection des seances en base
+- `import_calendar.py`: import du calendrier universitaire
+
+## Base de donnees
+
+Tables principales:
+- `annees_universitaires`
+- `semestres`
+- `periodes`
+- `departements`
+- `classes`
+- `professeurs`
+- `matieres`
+- `salles`
+- `groupes`
+- `emplois_versions`
+- `seances`
+- `emplois_enseignants_seances`
+- `vacances_jours_feries`
+
+Tables de securite:
+- `auth_users`
+- `auth_sessions`
 
 ## Installation
 
-### Prérequis
+## Prerequis
 - Node.js 18+
-- Python 3.9+
+- npm
+- Python 3.10+ recommande
 - PostgreSQL 14+
-- 16GB RAM minimum (pour le modèle LLM)
 - Git
 
-### 1. Cloner le projet
+## 1. Clonage
 
 ```bash
-git clone https://github.com/Nidhal21/time_guide.git
+git clone <votre-repo>
 cd time-guide-ai-main
 ```
 
-### 2. Configuration de l'environnement
+## 2. Base PostgreSQL
 
-#### Variables d'environnement
-Créer un fichier `.env` à la racine avec :
+Option manuelle:
+
+```bash
+psql -U postgres
+CREATE DATABASE emploi_temps;
+CREATE USER emploi_user WITH PASSWORD 'emploi_temps';
+GRANT ALL PRIVILEGES ON DATABASE emploi_temps TO emploi_user;
+\q
+```
+
+Option Docker:
+
+```bash
+docker-compose up -d
+```
+
+## 3. Configuration backend
+
+Creer `backend/.env` a partir de `backend/.env.example`.
+
+Exemple:
 
 ```env
-# Base de données
-DATABASE_URL=postgresql://username:password@localhost:5432/emploi_temps_db
-
-# JWT
-JWT_SECRET_KEY=votre_cle_secrete_jwt
-JWT_ALGORITHM=HS256
-JWT_ACCESS_TOKEN_EXPIRE_MINUTES=30
-
-# LLM
-MODEL_PATH=models/Qwen2.5-7B-Instruct
+DATABASE_URL=postgresql://emploi_user:emploi_temps@127.0.0.1:5432/emploi_temps
 GROQ_API_KEY=votre_cle_groq
-
-# Autres
-ADMIN_PASSWORD=admin123
+MODEL_NAME=Qwen/Qwen2.5-3B-Instruct
+ADMIN_EMAIL=admin@example.com
+ADMIN_PASSWORD=admin123456
+ADMIN_FULL_NAME=Administrateur ENETCOM
+AUTH_SESSION_TTL_DAYS=14
 ```
 
-### 3. Configuration Backend
+Installation et lancement:
 
 ```bash
-# Installer PostgreSQL et créer la base de données
-psql -U postgres
-CREATE DATABASE emploi_temps_db;
-\q
-
-# Initialiser la base de données
-psql -U postgres -d emploi_temps_db -f backend/init_db.sql
-
-# Créer un environnement virtuel Python
-python -m venv .venv
-.venv\Scripts\activate  # Sur Windows
-
-# Installer les dépendances Python
 cd backend
+python -m venv .venv
+.venv\Scripts\activate
 pip install -r requirements.txt
-
-# Lancer le backend
-uvicorn main:app --reload --port 8000
+uvicorn main:app --reload --host 127.0.0.1 --port 8000
 ```
 
-Ou utiliser le script de démarrage Windows :
-```bash
-start_backend.bat
-```
+## 4. Configuration frontend
 
-### 4. Configuration Frontend
+Depuis la racine:
 
 ```bash
-# Installer les dépendances
 npm install
-
-# Lancer le frontend
 npm run dev
 ```
 
-### 5. Utilisation avec Docker (Optionnel)
+Optionnel, creer `.env.local`:
 
-```bash
-# Construire et lancer les services
-docker-compose up --build
+```env
+VITE_API_URL=http://127.0.0.1:8000/api
 ```
+
+Le frontend tourne par defaut sur `http://localhost:8080`.
 
 ## Utilisation
 
-### Pour les Administrateurs
+### Chat
+- route: `/chat`
+- permet de discuter avec l'assistant universitaire
 
-1. Accéder à la page Admin (`/admin`)
-2. Se connecter avec les credentials admin
-3. Uploader un fichier Excel avec l'emploi du temps
-4. Spécifier la classe et la date de version
-5. Le système parse automatiquement et stocke dans la base de données
+### Admin
+- route: `/admin`
+- permet de charger les fichiers Excel
+- affiche les derniers imports
+- affiche les resultats d'import et les notifications popup
 
-Format Excel requis : Voir [EXCEL_FORMAT.md](backend/EXCEL_FORMAT.md)
+## API
 
-### Pour les Étudiants/Professeurs
+### Auth
+- `POST /api/auth/login`
+- `POST /api/auth/signup`
+- `GET /api/auth/me`
+- `POST /api/auth/logout`
 
-1. Accéder au chat (`/chat`)
-2. Se connecter avec vos credentials
-3. Poser des questions en langage naturel :
-   - "Où est Mr BEN SLIMA maintenant ?"
-   - "Dans quelle salle j'ai cours maintenant ?"
-   - "Quel est mon emploi du temps de demain ?"
-   - "Quand est-ce que j'ai cours de TRAIT IMAGES ?"
+### Chat
+- `POST /api/chat`
+
+Exemple:
+
+```json
+{
+  "message": "Quel est l'emploi du temps de 1 ING GII 2 aujourd'hui ?",
+  "user_role": "student",
+  "user_class": "1 ING GII 2",
+  "history": []
+}
+```
+
+### Admin
+- `GET /api/admin/imports/status`
+- `POST /api/admin/imports/upload`
+
+### Systeme
+- `GET /health`
+
+Documentation FastAPI:
+- `http://127.0.0.1:8000/docs`
 
 ## Tests
 
+### Frontend
+
+```bash
+npm run test
+```
+
 ### Backend
+
 ```bash
 cd backend
-pytest tests/
+python -m pytest tests
 ```
 
-### Frontend
+Les tests couvrent notamment:
+- l'API admin,
+- les imports,
+- l'authentification,
+- l'API chat,
+- l'agent SQL,
+- le parseur Excel,
+- le calendrier universitaire.
+
+## Build
+
 ```bash
-npm test
+npm run build
 ```
 
-## Structure du Projet
+## Securite et robustesse
 
-```
-time-guide-ai-main/
-├── backend/
-│   ├── app/
-│   │   ├── models/          # Modèles SQLAlchemy
-│   │   ├── routes/          # Routes API (chat, admin, auth)
-│   │   ├── services/        # Services (LLM, Excel, SQL, Auth)
-│   │   └── utils/
-│   ├── tests/               # Tests unitaires
-│   ├── main.py              # Point d'entrée FastAPI
-│   ├── requirements.txt     # Dépendances Python
-│   ├── init_db.sql          # Script SQL d'initialisation
-│   └── README.md            # Documentation backend
-├── src/
-│   ├── components/          # Composants React réutilisables
-│   ├── pages/               # Pages principales (Chat, Admin, Auth)
-│   ├── contexts/            # Contextes React (Auth)
-│   ├── hooks/               # Hooks personnalisés
-│   └── lib/                 # Utilitaires
-├── public/                  # Assets statiques
-├── docker-compose.yml       # Configuration Docker
-├── package.json             # Dépendances Node.js
-├── tsconfig.json            # Configuration TypeScript
-├── tailwind.config.ts       # Configuration Tailwind
-├── vite.config.ts           # Configuration Vite
-├── start_backend.bat        # Script de démarrage Windows
-└── README.md
-```
+- role admin obligatoire pour les imports,
+- mots de passe utilisateurs haches avec PBKDF2,
+- sessions stockees par hash de token,
+- verification des categories et semestres a l'import,
+- validation defensive des requetes SQL en lecture seule,
+- normalisation de texte pour reduire les problemes d'encodage.
 
-## API Endpoints
+## Limitations
 
-### Authentification
-- `POST /api/auth/login` - Connexion utilisateur
-- `POST /api/auth/register` - Inscription (si activé)
+- la qualite des reponses depend de la qualite des fichiers Excel importes,
+- certains formats atypiques d'Excel peuvent necessiter des adaptations,
+- la partie IA depend de la disponibilite de Groq si elle est activee,
+- PostgreSQL doit etre correctement configure pour exploiter tout le systeme.
 
-### Chat
-- `POST /api/chat` - Envoyer un message au chatbot
+## Documentation complementaire
 
-### Admin
-- `POST /api/admin/upload-emploi` - Uploader un emploi du temps Excel
-- `GET /api/admin/emplois` - Lister les emplois du temps
-
-### Health
-- `GET /health` - Vérifier l'état du serveur
-
-Documentation complète : `http://localhost:8000/docs`
-
-## Base de Données
-
-### Tables principales
-- `annees_universitaires` - Années académiques
-- `semestres` - Semestres
-- `departements` - Départements (GII, INFO, TELECOM)
-- `classes` - Classes
-- `professeurs` - Professeurs
-- `matieres` - Matières
-- `salles` - Salles de cours
-- `groupes` - Groupes (P1, P2, etc.)
-- `emplois_versions` - Versions des emplois du temps
-- `seances` - Séances de cours
-
-## Modèle LLM
-
-Le système utilise **Qwen2.5-7B-Instruct** pour :
-1. Comprendre les questions en langage naturel
-2. Générer des requêtes SQL appropriées
-3. Formater les réponses de manière naturelle
-
-Le modèle est téléchargé automatiquement depuis Hugging Face au premier démarrage.
-
-## Développement
-
-### Frontend
-```bash
-npm run dev      # Mode développement
-npm run build    # Build production
-npm run preview  # Prévisualiser le build
-```
-
-### Backend
-```bash
-uvicorn main:app --reload  # Mode développement avec hot-reload
-```
-
-## Troubleshooting
-
-### Le modèle LLM ne charge pas
-- Vérifier que vous avez assez de RAM (16GB minimum)
-- Utiliser la quantization 8-bit si nécessaire
-- Vérifier votre connexion internet pour le téléchargement
-
-### Erreur de connexion PostgreSQL
-- Vérifier que PostgreSQL est démarré
-- Vérifier les credentials dans `backend/.env`
-- Vérifier que la base de données existe
-
-### Import Excel échoue
-- Vérifier le format du fichier (voir EXCEL_FORMAT.md)
-- Vérifier que toutes les colonnes requises sont présentes
-
-## Contribution
-
-1. Fork le projet
-2. Créer une branche feature (`git checkout -b feature/nouvelle-fonction`)
-3. Commit vos changements (`git commit -am 'Ajout nouvelle fonction'`)
-4. Push vers la branche (`git push origin feature/nouvelle-fonction`)
-5. Créer une Pull Request
-
-## Licence
-
-Ce projet est sous licence MIT. Voir le fichier `LICENSE` pour plus de détails.
-
-## Support
-
-Pour toute question ou problème :
-- Ouvrir une issue sur GitHub
-- Contacter l'équipe de développement
+- `ARCHITECTURE_DIAGRAM.md`
+- `PROJECT_STRUCTURE.md`
+- `SUMMARY.md`
+- `LLM_ARCHITECTURE.md`
+- `backend/API_DOCUMENTATION.md`
+- `backend/README.md`
+- `rapport.md`

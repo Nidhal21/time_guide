@@ -192,11 +192,28 @@ const Admin = () => {
       }
 
       const data = await response.json();
-      setResults(data.results ?? []);
+      const uploadResults = (data.results ?? []) as UploadResult[];
+      const errorResults = uploadResults.filter((result) => result.status === "error");
+
+      setResults(uploadResults);
       setSummary(data.summary ?? null);
       setSelectedFiles({});
       setRefreshTick((value) => value + 1);
-      toast.success("Import termine.");
+
+      setError(errorResults.length > 0 ? errorResults[0].message : null);
+
+      uploadResults.forEach((result) => {
+        if (result.status === "error") {
+          toast.error(result.label, {
+            description: result.message,
+          });
+          return;
+        }
+
+        toast.success(result.label, {
+          description: result.message,
+        });
+      });
     } catch (err) {
       const message = err instanceof Error ? err.message : "Erreur inconnue.";
       setError(message);

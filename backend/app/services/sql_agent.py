@@ -4,6 +4,9 @@ from __future__ import annotations
 import re
 import unicodedata
 from datetime import date, datetime, timedelta
+from difflib import SequenceMatcher
+from threading import Lock
+from time import monotonic
 from typing import Optional, Dict, Any, Tuple
 
 from sqlalchemy.orm import Session
@@ -93,11 +96,24 @@ DAY_MAP_ISO = {
 
 DAY_NAME_MAP = {day.lower(): day for day in DAY_MAP_ISO.values()}
 
+PROFESSOR_DIRECTORY_CACHE_TTL_SECONDS = 600
+_PROFESSOR_DIRECTORY_CACHE_LOCK = Lock()
+_PROFESSOR_DIRECTORY_CACHE: dict[str, Any] = {
+    "loaded_at": 0.0,
+    "reference_names": None,
+    "all_names": None,
+}
+
 
 class SQLAgent:
     def __init__(self, db: Session):
         self.db = db
         self._exec_and_format = self._exec_and_format_v2
+        self._reference_professor_names_cache: Optional[list[str]] = None
+        self._all_professor_names_cache: Optional[list[str]] = None
+        self._candidate_professor_names_cache: dict[str, list[str]] = {}
+        self._canonical_professor_name_cache: dict[str, str] = {}
+        self._hydrate_professor_caches_from_global()
 
     # ---------------------------------------------------------------------
     #  Keep only last user message if history injected
@@ -147,6 +163,461 @@ class SQLAgent:
 
     def _norm(self, s: str) -> str:
         return re.sub(r"\s+", "", self._normalize_text(s))
+
+    def _hydrate_professor_caches_from_global(self) -> None:
+        cached_all_names = _PROFESSOR_DIRECTORY_CACHE.get("all_names")
+        cached_reference_names = _PROFESSOR_DIRECTORY_CACHE.get("reference_names")
+        loaded_at = float(_PROFESSOR_DIRECTORY_CACHE.get("loaded_at") or 0.0)
+        if not cached_all_names or not cached_reference_names:
+            return
+        if monotonic() - loaded_at > PROFESSOR_DIRECTORY_CACHE_TTL_SECONDS:
+            return
+
+        self._all_professor_names_cache = list(cached_all_names)
+        self._reference_professor_names_cache = list(cached_reference_names)
+
+    def _store_professor_caches_globally(self, all_names: list[str], reference_names: list[str]) -> None:
+        if not all_names or not reference_names:
+            return
+        with _PROFESSOR_DIRECTORY_CACHE_LOCK:
+            _PROFESSOR_DIRECTORY_CACHE["loaded_at"] = monotonic()
+            _PROFESSOR_DIRECTORY_CACHE["all_names"] = list(all_names)
+            _PROFESSOR_DIRECTORY_CACHE["reference_names"] = list(reference_names)
+
+    def _load_reference_professor_names_from_db(self) -> list[str]:
+        if not self.db:
+            return []
+        try:
+            rows = self.db.execute(
+                text(
+                    """
+                    SELECT DISTINCT p.nom_complet
+                    FROM professeurs p
+                    WHERE p.nom_complet IS NOT NULL AND TRIM(p.nom_complet) <> ''
+                    ORDER BY p.nom_complet
+                    """
+                )
+            ).fetchall()
+        except Exception:
+            return []
+        return [
+            self._clean_professor_display_name(str(row[0] or "").strip())
+            for row in rows
+            if str(row[0] or "").strip()
+        ]
+
+    def _load_all_professor_names_from_db(self) -> list[str]:
+        if not self.db:
+            return []
+        try:
+            rows = self.db.execute(
+                text(
+                    """
+                    SELECT DISTINCT name
+                    FROM (
+                        SELECT nom_complet AS name FROM professeurs
+                        UNION
+                        SELECT professeur_nom_complet AS name FROM emplois_enseignants_seances
+                    ) names
+                    WHERE name IS NOT NULL AND TRIM(name) <> ''
+                    ORDER BY name
+                    """
+                )
+            ).fetchall()
+        except Exception:
+            return []
+
+        names = []
+        for row in rows:
+            names.extend(self._candidate_professor_names(str(row[0] or "").strip()))
+        return list(dict.fromkeys(name for name in names if name))
+
+    def _collapse_repeated_letters(self, token: str) -> str:
+        return re.sub(r"([a-z0-9])\1+", r"\1", token or "")
+
+    def _normalized_token_parts(self, value: str) -> list[str]:
+        return [
+            re.sub(r"[^a-z0-9]", "", self._normalize_text(part))
+            for part in re.split(r"[\s/-]+", value or "")
+            if part.strip()
+        ]
+
+    def _string_similarity(self, left: str, right: str) -> float:
+        left_value = left or ""
+        right_value = right or ""
+        if not left_value or not right_value:
+            return 0.0
+
+        left_compact = self._collapse_repeated_letters(left_value)
+        right_compact = self._collapse_repeated_letters(right_value)
+        return max(
+            SequenceMatcher(None, left_value, right_value).ratio(),
+            SequenceMatcher(None, left_compact, right_compact).ratio(),
+        )
+
+    def _score_professor_candidate(self, requested_name: str, candidate_name: str) -> float:
+        requested_tokens = self._normalized_token_parts(requested_name)
+        candidate_tokens = self._normalized_token_parts(candidate_name)
+        if not requested_tokens or not candidate_tokens:
+            return 0.0
+
+        requested_joined = "".join(requested_tokens)
+        candidate_joined = "".join(candidate_tokens)
+        score = self._string_similarity(requested_joined, candidate_joined)
+
+        requested_surname = requested_tokens[-1]
+        surname_score = max(self._string_similarity(requested_surname, candidate_token) for candidate_token in candidate_tokens)
+        score = max(score, surname_score)
+
+        token_pair_score = 0.0
+        for requested_token in requested_tokens:
+            if len(requested_token) < 3:
+                continue
+            candidate_scores = [
+                self._string_similarity(requested_token, candidate_token)
+                for candidate_token in candidate_tokens
+                if len(candidate_token) >= 3
+            ]
+            if not candidate_scores:
+                continue
+            token_pair_score = max(
+                token_pair_score,
+                max(candidate_scores),
+            )
+        score = max(score, token_pair_score)
+
+        common_tokens = set(requested_tokens) & set(candidate_tokens)
+        if common_tokens:
+            score += 0.08 * (len(common_tokens) / max(len(set(requested_tokens)), len(set(candidate_tokens))))
+        if requested_tokens[0][0] == candidate_tokens[0][0]:
+            score += 0.04
+        if surname_score >= 0.72:
+            score += 0.12
+
+        return min(score, 0.99)
+
+    def _surname_similarity(self, requested_name: str, candidate_name: str) -> float:
+        requested_tokens = self._professor_tokens_for_match(requested_name)
+        candidate_tokens = self._professor_tokens_for_match(candidate_name)
+        if not requested_tokens or not candidate_tokens:
+            return 0.0
+        return max(self._string_similarity(requested_tokens[-1], candidate_token) for candidate_token in candidate_tokens)
+
+    def _is_relevant_professor_candidate(self, requested_name: str, candidate_name: str) -> bool:
+        requested_tokens = [token for token in self._professor_tokens_for_match(requested_name) if len(token) >= 2]
+        candidate_tokens = [token for token in self._professor_tokens_for_match(candidate_name) if len(token) >= 2]
+        if not requested_tokens or not candidate_tokens:
+            return False
+
+        if len(requested_tokens) == 1:
+            return any(
+                requested_tokens[0] == candidate_token
+                or requested_tokens[0].startswith(candidate_token)
+                or candidate_token.startswith(requested_tokens[0])
+                for candidate_token in candidate_tokens
+            )
+
+        surname_score = self._surname_similarity(requested_name, candidate_name)
+        first_score = max(self._string_similarity(requested_tokens[0], candidate_token) for candidate_token in candidate_tokens)
+        has_secondary_overlap = any(
+            req == cand or req.startswith(cand) or cand.startswith(req)
+            for req in requested_tokens[1:]
+            for cand in candidate_tokens
+        )
+        return surname_score >= 0.72 or (surname_score >= 0.6 and first_score >= 0.8) or has_secondary_overlap
+
+    def _rank_professor_candidates(self, prof_name: str, min_score: float = 0.58, limit: int = 3) -> list[str]:
+        requested_key = "".join(self._normalized_token_parts(prof_name))
+        if not requested_key:
+            return []
+
+        scored_matches: list[tuple[float, int, str]] = []
+        seen_keys = set()
+
+        for candidate_name in self._all_professor_names():
+            candidate_key = "".join(self._normalized_token_parts(candidate_name))
+            if not candidate_key or candidate_key == requested_key or candidate_key in seen_keys:
+                continue
+            seen_keys.add(candidate_key)
+
+            if not self._is_relevant_professor_candidate(prof_name, candidate_name):
+                continue
+
+            score = self._score_professor_candidate(prof_name, candidate_name)
+            if score < min_score:
+                continue
+
+            scored_matches.append((score, abs(len(candidate_key) - len(requested_key)), candidate_name))
+
+        scored_matches.sort(key=lambda item: (-item[0], item[1], item[2].lower()))
+        if not scored_matches:
+            return []
+
+        best_score = scored_matches[0][0]
+        filtered = [item for item in scored_matches if item[0] >= max(min_score, best_score - 0.08)]
+        return [name for _, _, name in filtered[:limit]]
+
+    def _find_similar_professors(self, prof_name: str, limit: int = 3) -> list[str]:
+        return self._rank_professor_candidates(prof_name, min_score=0.7, limit=limit)
+
+    def _all_professor_names(self) -> list[str]:
+        if self._all_professor_names_cache is not None:
+            return self._all_professor_names_cache
+        self._hydrate_professor_caches_from_global()
+        if self._all_professor_names_cache is not None:
+            return self._all_professor_names_cache
+
+        if self._reference_professor_names_cache is None:
+            self._reference_professor_names_cache = self._load_reference_professor_names_from_db()
+        self._all_professor_names_cache = self._load_all_professor_names_from_db()
+        self._store_professor_caches_globally(
+            self._all_professor_names_cache,
+            self._reference_professor_names_cache or [],
+        )
+        return self._all_professor_names_cache
+
+    def _reference_professor_names(self) -> list[str]:
+        if self._reference_professor_names_cache is not None:
+            return self._reference_professor_names_cache
+        self._hydrate_professor_caches_from_global()
+        if self._reference_professor_names_cache is not None:
+            return self._reference_professor_names_cache
+
+        self._reference_professor_names_cache = self._load_reference_professor_names_from_db()
+        return self._reference_professor_names_cache
+
+    def _clean_professor_display_name(self, value: str) -> str:
+        cleaned = re.sub(r"\s+", " ", (value or "")).strip()
+        cleaned = re.sub(r"^(?:(?:mr|mme|m\.|monsieur|madame)\s+)+", "", cleaned, flags=re.IGNORECASE)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip(" ,;/")
+        return cleaned
+
+    def _candidate_professor_names(self, value: str) -> list[str]:
+        cache_key = value or ""
+        if cache_key in self._candidate_professor_names_cache:
+            return self._candidate_professor_names_cache[cache_key]
+        if not value:
+            return []
+        parts = re.split(r"\s*/\s*", value)
+        candidates = []
+        for part in parts:
+            cleaned = self._clean_professor_display_name(part)
+            if not cleaned:
+                continue
+            candidates.append(self._canonical_professor_name(cleaned))
+        result = list(dict.fromkeys(candidate for candidate in candidates if candidate))
+        self._candidate_professor_names_cache[cache_key] = result
+        return result
+
+    def _canonical_professor_name(self, value: str) -> str:
+        cleaned = self._clean_professor_display_name(value)
+        if not cleaned:
+            return ""
+        if cleaned in self._canonical_professor_name_cache:
+            return self._canonical_professor_name_cache[cleaned]
+
+        input_tokens = self._professor_tokens_for_match(cleaned)
+        if not input_tokens:
+            return cleaned
+
+        references = self._reference_professor_names()
+        if not references:
+            return cleaned
+
+        exact_matches = []
+        initial_matches = []
+        input_signature = sorted(input_tokens)
+
+        for reference in references:
+            ref_tokens = self._professor_tokens_for_match(reference)
+            if not ref_tokens:
+                continue
+            if sorted(ref_tokens) == input_signature:
+                exact_matches.append(reference)
+                continue
+            if self._tokens_match_professor_reference(input_tokens, ref_tokens):
+                initial_matches.append(reference)
+
+        if len(exact_matches) == 1:
+            self._canonical_professor_name_cache[cleaned] = exact_matches[0]
+            return exact_matches[0]
+        if len(initial_matches) == 1:
+            self._canonical_professor_name_cache[cleaned] = initial_matches[0]
+            return initial_matches[0]
+        self._canonical_professor_name_cache[cleaned] = cleaned
+        return cleaned
+
+    def _tokens_match_professor_reference(self, input_tokens: list[str], ref_tokens: list[str]) -> bool:
+        remaining = list(ref_tokens)
+        for token in input_tokens:
+            match_index = None
+            for index, ref_token in enumerate(remaining):
+                if token == ref_token:
+                    match_index = index
+                    break
+                if len(token) == 1 and ref_token.startswith(token):
+                    match_index = index
+                    break
+                if len(token) >= 3 and len(ref_token) >= 3 and (token.startswith(ref_token) or ref_token.startswith(token)):
+                    match_index = index
+                    break
+            if match_index is None:
+                return False
+            remaining.pop(match_index)
+        return True
+
+    def _professor_tokens_for_match(self, value: str) -> list[str]:
+        titles = {"mr", "mme", "m", "monsieur", "madame"}
+        return [token for token in self._normalized_token_parts(value) if token and token not in titles]
+
+    def _find_exact_professor_names(self, prof_name: str) -> list[str]:
+        requested_tokens = self._professor_tokens_for_match(prof_name)
+        if not requested_tokens:
+            return []
+
+        requested_joined = "".join(requested_tokens)
+        requested_signature = sorted(requested_tokens)
+        matches = []
+        for candidate_name in self._all_professor_names():
+            candidate_tokens = self._professor_tokens_for_match(candidate_name)
+            if not candidate_tokens:
+                continue
+            if "".join(candidate_tokens) == requested_joined or sorted(candidate_tokens) == requested_signature:
+                matches.append(candidate_name)
+        return list(dict.fromkeys(matches))
+
+    def _resolve_professor_name(self, prof_name: str) -> Optional[str]:
+        if not prof_name:
+            return None
+
+        exact_matches = self._find_exact_professor_names(prof_name)
+        if len(exact_matches) == 1:
+            return exact_matches[0]
+
+        requested_tokens = [token for token in self._professor_tokens_for_match(prof_name) if len(token) >= 3]
+        matches = self._find_matching_professors(prof_name)
+        if len(requested_tokens) >= 2 and len(matches) == 1:
+            return matches[0]
+
+        return None
+
+    def _find_matching_professors(self, prof_name: str, limit: int = 3) -> list[str]:
+        requested_tokens = [token for token in self._professor_tokens_for_match(prof_name) if len(token) >= 3]
+        if not requested_tokens:
+            return []
+
+        min_score = 0.78 if len(requested_tokens) >= 2 else 0.88
+        return self._rank_professor_candidates(prof_name, min_score=min_score, limit=limit)
+
+    def _exact_professor_match_condition(self, prof_name: str, field_sql: str = "p.nom_complet") -> Optional[str]:
+        cleaned_name = self._clean_professor_display_name(prof_name)
+        target_key = "".join(self._normalized_token_parts(cleaned_name))
+        if not target_key:
+            return None
+        expr = f"REPLACE(REPLACE(REPLACE(LOWER({field_sql}), ' ', ''), '.', ''), '-', '')"
+        return f"{expr} = '{target_key}'"
+
+    def _best_professor_match_condition(self, prof_name: str, field_sql: str = "p.nom_complet") -> Optional[str]:
+        resolved_name = self._resolve_professor_name(prof_name) or prof_name
+        return self._exact_professor_match_condition(resolved_name, field_sql) or self._professor_match_condition(resolved_name, field_sql)
+
+    def _professor_confirmation_message(self, prof_name: str) -> Optional[str]:
+        if not prof_name:
+            return None
+
+        exact_matches = self._find_exact_professor_names(prof_name)
+        if exact_matches:
+            return None
+
+        requested_tokens = [token for token in self._professor_tokens_for_match(prof_name) if len(token) >= 3]
+        matches = self._find_matching_professors(prof_name)
+
+        if len(requested_tokens) <= 1:
+            if len(matches) == 1:
+                return f"Voulez-vous dire le professeur '{matches[0]}' ?"
+            if matches:
+                return f"Je ne suis pas sur du professeur '{prof_name}'. Voulez-vous dire : {', '.join(matches)} ?"
+
+        if len(matches) == 1:
+            return f"Le nom '{prof_name}' ressemble a '{matches[0]}'. Voulez-vous dire ce professeur ?"
+        if len(matches) > 1:
+            return f"Le nom '{prof_name}' est ambigu. Voulez-vous dire : {', '.join(matches)} ?"
+
+        similar = self._find_similar_professors(prof_name)
+        if len(similar) == 1:
+            return f"Le nom '{prof_name}' ressemble a '{similar[0]}'. Voulez-vous dire ce professeur ?"
+        if similar:
+            return f"Le nom '{prof_name}' est proche de plusieurs professeurs. Voulez-vous dire : {', '.join(similar)} ?"
+
+        return None
+
+    def _score_room_candidate(self, requested_room: str, candidate_room: str) -> float:
+        requested_key = self._room_key(requested_room)
+        candidate_key = self._room_key(candidate_room)
+        if not requested_key or not candidate_key:
+            return 0.0
+
+        score = self._string_similarity(requested_key, candidate_key)
+        if requested_key[:1] and requested_key[:1] == candidate_key[:1]:
+            score += 0.08
+        if requested_key[-1:] and requested_key[-1:] == candidate_key[-1:]:
+            score += 0.05
+        return min(score, 0.99)
+
+    def _find_similar_rooms(self, room_name: str, limit: int = 5) -> list[str]:
+        if not self.db or not room_name:
+            return []
+
+        try:
+            rows = self.db.execute(
+                text(
+                    """
+                    SELECT DISTINCT sa.nom
+                    FROM salles sa
+                    WHERE sa.nom IS NOT NULL AND TRIM(sa.nom) <> ''
+                    """
+                )
+            ).fetchall()
+        except Exception:
+            return []
+
+        requested_key = self._room_key(room_name)
+        scored_matches: list[tuple[float, int, str]] = []
+        seen_keys = set()
+
+        for row in rows:
+            candidate_name = str(row[0] or "").strip()
+            candidate_key = self._room_key(candidate_name)
+            if not candidate_key or candidate_key == requested_key or candidate_key in seen_keys:
+                continue
+            seen_keys.add(candidate_key)
+
+            score = self._score_room_candidate(room_name, candidate_name)
+            if score < 0.55:
+                continue
+
+            scored_matches.append((score, abs(len(candidate_key) - len(requested_key)), self._normalize_room_name(candidate_name)))
+
+        scored_matches.sort(key=lambda item: (-item[0], item[1], item[2].lower()))
+        return [name for _, _, name in scored_matches[:limit]]
+
+    def _prof_not_found_message(self, prof_name: str) -> str:
+        suggestions = self._find_similar_professors(prof_name)
+        if suggestions:
+            return (
+                f"Le professeur '{prof_name}' n'existe pas dans la base de donnees. "
+                f"Voici des noms similaires : {', '.join(suggestions)}."
+            )
+        return f"Je ne trouve pas le professeur '{prof_name}' dans la base de donnees."
+
+    def _room_not_found_message(self, room_name: str) -> str:
+        suggestions = self._find_similar_rooms(room_name)
+        if suggestions:
+            return (
+                f"La salle '{room_name}' n'existe pas dans la base de donnees. "
+                f"Voici des salles similaires : {', '.join(suggestions)}."
+            )
+        return f"Je ne trouve pas la salle '{room_name}' dans la base de donnees."
 
     def _context_date(self, context: dict) -> date:
         da = context.get("date_actuelle")
@@ -330,6 +801,7 @@ class SQLAgent:
     # ---------------------------------------------------------------------
     def _extract_class_candidate(self, question: str) -> Optional[str]:
         q = (question or "").strip()
+        shorthand_codes = {"GII", "GEC", "GT", "IDSD", "INFO", "TELECOM"}
 
         m = re.search(
             r"\b(\d)\s*(ING|TIC|LTIC|MP|MR)\b(?:\s+([A-Z0-9\-]+))?(?:\s+([A-Z0-9\-]+))?(?:\s+(\d))?\b",
@@ -347,15 +819,23 @@ class SQLAgent:
                 return None
             return cls
 
-        m2 = re.search(r"\b(\d)\s*([A-Za-z\-]{2,10})\s*(\d)\b", q)
+        m2 = re.search(r"\b(\d)\s*([A-Za-z\-]{2,10})\s*(\d)\b", q, flags=re.IGNORECASE)
         if m2:
             a, mid, b = m2.group(1), m2.group(2), m2.group(3)
             mid_u = mid.upper()
-            if mid_u in {"GII", "GEC", "GT", "INFO", "TELECOM"}:
+            if mid_u in shorthand_codes:
                 return f"{a} ING {mid_u} {b}"
             return f"{a} {mid_u} {b}"
 
+        m3 = re.search(r"\b(\d)(GII|GEC|GT|IDSD|INFO|TELECOM)(\d)\b", q, flags=re.IGNORECASE)
+        if m3:
+            year, specialty, group = m3.group(1), m3.group(2).upper(), m3.group(3)
+            return f"{year} ING {specialty} {group}"
+
         return None
+
+    def _class_key(self, class_name: str) -> str:
+        return re.sub(r"[\s-]+", "", self._normalize_text(class_name or ""))
 
     def _normalize_class_aliases(self, class_name: str, context: dict) -> str:
         if not class_name:
@@ -369,7 +849,7 @@ class SQLAgent:
         if not class_name or not context.get("semestre_id"):
             return False
         sem_id = int(context["semestre_id"])
-        key = self._norm(class_name)
+        key = self._class_key(class_name)
         row = self.db.execute(
             text(
                 """
@@ -383,6 +863,93 @@ class SQLAgent:
             {"sem_id": sem_id, "key": key},
         ).first()
         return bool(row)
+
+    def _is_class_schedule_question(self, question: str) -> bool:
+        if not self._is_schedule_intent(question):
+            return False
+        if not self._extract_class_candidate(question):
+            return False
+        if self._extract_room_candidate(question):
+            return False
+        if self._extract_schedule_prof_candidate(question) or self._extract_prof_candidate(question):
+            return False
+        return True
+
+    def _class_schedule_period_id(self, question: str, context: dict) -> Optional[int]:
+        q = (question or "").lower()
+        want_p1 = bool(re.search(r"\bp\s*1\b", q))
+        want_p2 = bool(re.search(r"\bp\s*2\b", q))
+        if want_p1 and want_p2:
+            return None
+
+        if (want_p1 or want_p2) and context.get("semestre_id") and self.db:
+            marker = "P1" if want_p1 else "P2"
+            row = self.db.execute(
+                text(
+                    """
+                    SELECT id
+                    FROM periodes
+                    WHERE semestre_id = :semester_id
+                      AND UPPER(nom) = :periode_nom
+                    LIMIT 1
+                    """
+                ),
+                {
+                    "semester_id": int(context["semestre_id"]),
+                    "periode_nom": marker,
+                },
+            ).first()
+            return int(row[0]) if row else None
+
+        if self._is_full_schedule_request(question):
+            return None
+
+        current_period_id = context.get("periode_id")
+        return int(current_period_id) if current_period_id else None
+
+    def _class_schedule_sql(self, question: str, context: dict) -> Tuple[str, Dict[str, Any]]:
+        cls = self._extract_class_candidate(question) or ""
+        cls = self._normalize_class_aliases(cls, context)
+        requested_day = self._extract_requested_day(question, context)
+
+        sql = """
+        SELECT
+            c.nom AS classe,
+            m.nom AS matiere,
+            p.nom_complet AS professeur,
+            sa.nom AS salle,
+            s.jour,
+            s.heure_debut,
+            s.heure_fin,
+            s.type_seance
+        FROM seances s
+        JOIN emplois_versions v ON v.id = s.version_id AND v.actif = true AND v.classe_id = s.classe_id
+        JOIN classes c ON c.id = s.classe_id
+        JOIN matieres m ON m.id = s.matiere_id
+        JOIN professeurs p ON p.id = s.professeur_id
+        JOIN salles sa ON sa.id = s.salle_id
+        WHERE REPLACE(REPLACE(LOWER(c.nom), ' ', ''), '-', '') = :class_key
+        """
+        params: Dict[str, Any] = {
+            "class_key": self._class_key(cls),
+        }
+
+        target_period_id = self._class_schedule_period_id(question, context)
+        if target_period_id:
+            sql += " AND s.periode_id = :periode_id\n"
+            params["periode_id"] = target_period_id
+
+        if requested_day:
+            sql += " AND LOWER(s.jour) = LOWER(:target_day)\n"
+            params["target_day"] = requested_day
+
+        sql += (
+            " ORDER BY CASE LOWER(s.jour) "
+            "WHEN 'lundi' THEN 1 WHEN 'mardi' THEN 2 WHEN 'mercredi' THEN 3 "
+            "WHEN 'jeudi' THEN 4 WHEN 'vendredi' THEN 5 WHEN 'samedi' THEN 6 "
+            "WHEN 'dimanche' THEN 7 ELSE 8 END, s.heure_debut, s.heure_fin;"
+        )
+        return sql, params
 
     def _professor_match_condition(self, prof_name: str, field_sql: str = "p.nom_complet") -> Optional[str]:
         if not prof_name:
@@ -1048,7 +1615,7 @@ class SQLAgent:
     def _teacher_prof_exists_in_db(self, prof_name: str) -> bool:
         if not self.db:
             return False
-        condition = self._professor_match_condition(prof_name, "te.professeur_nom_complet")
+        condition = self._best_professor_match_condition(prof_name, "te.professeur_nom_complet")
         if not condition:
             return False
         row = self.db.execute(
@@ -1059,7 +1626,7 @@ class SQLAgent:
     def _prof_exists_in_db(self, prof_name: str) -> bool:
         if self._teacher_prof_exists_in_db(prof_name):
             return True
-        condition = self._professor_match_condition(prof_name)
+        condition = self._best_professor_match_condition(prof_name)
         if not condition or not self.db:
             return False
 
@@ -1070,7 +1637,8 @@ class SQLAgent:
 
     def _teacher_prof_schedule_sql(self, question: str, context: dict) -> Tuple[str, Dict[str, Any]]:
         prof_name = self._extract_schedule_prof_candidate(question) or self._extract_prof_candidate(question) or ""
-        prof_condition = self._professor_match_condition(prof_name, "te.professeur_nom_complet") or "1=0"
+        prof_name = self._resolve_professor_name(prof_name) or prof_name
+        prof_condition = self._best_professor_match_condition(prof_name, "te.professeur_nom_complet") or "1=0"
         requested_day = self._extract_requested_day(question, context)
         sql = f"""
         SELECT
@@ -1088,45 +1656,30 @@ class SQLAgent:
         if context.get("semestre_id"):
             sql += " AND te.semestre_id = :semester_id\n"
             params["semester_id"] = int(context["semestre_id"])
-        if context.get("periode"):
+        requested_periode = self._schedule_periode_name(question, context)
+        if requested_periode:
             sql += " AND UPPER(te.periode_nom) = :periode_nom\n"
-            params["periode_nom"] = str(context["periode"]).upper()
+            params["periode_nom"] = requested_periode
         if requested_day:
             sql += " AND LOWER(te.jour) = LOWER(:target_day)\n"
             params["target_day"] = requested_day
         sql += " ORDER BY CASE LOWER(te.jour) WHEN 'lundi' THEN 1 WHEN 'mardi' THEN 2 WHEN 'mercredi' THEN 3 WHEN 'jeudi' THEN 4 WHEN 'vendredi' THEN 5 WHEN 'samedi' THEN 6 WHEN 'dimanche' THEN 7 ELSE 8 END, te.heure_debut, te.heure_fin;"
         return sql, params
 
-    def _extract_prof_candidate(self, question: str) -> Optional[str]:
-        q = (question or "").strip()
-        if self._is_schedule_intent(q) and self._extract_class_candidate(q):
-            return None
+    def _schedule_periode_name(self, question: str, context: dict) -> Optional[str]:
+        q = (question or "").lower()
+        want_p1 = bool(re.search(r"\bp\s*1\b", q))
+        want_p2 = bool(re.search(r"\bp\s*2\b", q))
+        if want_p1 and not want_p2:
+            return "P1"
+        if want_p2 and not want_p1:
+            return "P2"
+        if self._question_is_day_specific(question) or self._question_mentions_now(question):
+            periode = context.get("periode")
+            return str(periode).upper() if periode else None
+        return None
 
-        match = re.search(
-            r"\b(mr|mme|m\.|monsieur|madame)\s+([A-Za-zÀ-ÿ'\-]+\s+[A-Za-zÀ-ÿ'\-]+(?:\s+[A-Za-zÀ-ÿ'\-]+)?)\b",
-            q,
-            re.IGNORECASE,
-        )
-        if match:
-            return match.group(2).strip()
-
-        match = re.search(r"\bde\s+([A-Za-zÀ-ÿ'\-]+\s+[A-Za-zÀ-ÿ'\-]+)\b", q, re.IGNORECASE)
-        if match:
-            candidate = match.group(1).strip()
-        else:
-            fallback_match = re.search(
-                r"(?:dans quelle classe se trouve|ou se trouve|pour quelle classe|quelle classe pour)\s+([A-Za-zÀ-ÿ'\-]+(?:\s+[A-Za-zÀ-ÿ'\-]+){0,2})$",
-                q,
-                re.IGNORECASE,
-            )
-            if fallback_match:
-                candidate = fallback_match.group(1).strip()
-            else:
-                bare_match = re.fullmatch(r"\s*([A-Za-zÀ-ÿ'\-]+(?:\s+[A-Za-zÀ-ÿ'\-]+){1,2})\s*", q)
-                if not bare_match or self._extract_class_candidate(q):
-                    return None
-                candidate = bare_match.group(1).strip()
-
+    def _is_valid_prof_candidate_text(self, candidate: str) -> bool:
         normalized_candidate = self._normalize_text(candidate)
         candidate_tokens = [token for token in re.split(r"[\s\-]+", normalized_candidate) if token]
 
@@ -1190,22 +1743,75 @@ class SQLAgent:
             "horaire",
             "edt",
         }
-        if normalized_candidate in invalid_candidates or any(token in invalid_tokens for token in candidate_tokens):
+        return not (
+            normalized_candidate in invalid_candidates
+            or any(token in invalid_tokens for token in candidate_tokens)
+        )
+
+    def _extract_prof_candidate(self, question: str) -> Optional[str]:
+        q = (question or "").strip()
+        if self._is_schedule_intent(q) and self._extract_class_candidate(q):
+            return None
+
+        match = re.search(
+            r"\b(mr|mme|m\.|monsieur|madame)\s+([A-Za-zÀ-ÿ'\-]+\s+[A-Za-zÀ-ÿ'\-]+(?:\s+[A-Za-zÀ-ÿ'\-]+)?)\b",
+            q,
+            re.IGNORECASE,
+        )
+        if match:
+            return match.group(2).strip()
+
+        match = re.search(r"\bde\s+([A-Za-zÀ-ÿ'\-]+\s+[A-Za-zÀ-ÿ'\-]+)\b", q, re.IGNORECASE)
+        if match:
+            candidate = match.group(1).strip()
+        else:
+            fallback_match = re.search(
+                r"(?:dans quelle classe se trouve|ou se trouve|pour quelle classe|quelle classe pour)\s+([A-Za-zÀ-ÿ'\-]+(?:\s+[A-Za-zÀ-ÿ'\-]+){0,2})$",
+                q,
+                re.IGNORECASE,
+            )
+            if fallback_match:
+                candidate = fallback_match.group(1).strip()
+            else:
+                bare_match = re.fullmatch(r"\s*([A-Za-zÀ-ÿ'\-]+(?:\s+[A-Za-zÀ-ÿ'\-]+){1,2})\s*", q)
+                if not bare_match or self._extract_class_candidate(q):
+                    return None
+                candidate = bare_match.group(1).strip()
+
+        if not self._is_valid_prof_candidate_text(candidate):
             return None
 
         return candidate
 
     def _extract_room_candidate(self, question: str) -> Optional[str]:
-        match = re.search(r"\bsalle\s+([A-Za-z0-9][A-Za-z0-9\- ]*)\b", question or "", flags=re.IGNORECASE)
-        if not match:
-            return None
-        return self._normalize_room_name(match.group(1))
+        question_text = question or ""
+        patterns = [
+            r"\bsalle\s+([A-Za-z0-9][A-Za-z0-9\- ]*)\b",
+            r"\bemploi(?:s)?\s+(?:du|de)\s+temps\s+de\s+([A-Za-z]{1,6}\s*0?\d{1,2})\b",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, question_text, flags=re.IGNORECASE)
+            if not match:
+                continue
+            candidate = re.sub(
+                r"\b(lundi|mardi|mercredi|jeudi|vendredi|samedi|dimanche|aujourd'hui|aujourdhui|demain|hier|maintenant|actuellement|mtn)\b.*$",
+                "",
+                match.group(1),
+                flags=re.IGNORECASE,
+            ).strip()
+            normalized = self._normalize_room_name(candidate)
+            if re.fullmatch(r"[A-Z][0-9]{2}", normalized) or re.fullmatch(r"[A-Z]{2,}[0-9]{1,2}", normalized):
+                return normalized
+            if pattern == patterns[0]:
+                return normalized
+        return None
 
     def _normalize_room_name(self, room_name: str) -> str:
         if not room_name:
             return ""
         room = re.sub(r"\s+", " ", room_name).strip().upper()
-        room = re.sub(r"\bC\s+(\d{2})\b", r"C\1", room)
+        room = re.sub(r"\b([A-Z])\s+(\d{2})\b", r"\1\2", room)
+        room = re.sub(r"\b([A-Z])\s*0?(\d)\b", lambda match: f"{match.group(1)}{int(match.group(2)):02d}", room)
         room = re.sub(r"\bTEL-TCOM1\b", "TEL-TCOM 1", room)
         room = re.sub(r"\bEL-CI\s+AUTO\b", "EL-CI AUTO", room)
         room = re.sub(r"\s*/\s*", " / ", room)
@@ -1240,6 +1846,9 @@ class SQLAgent:
     def _is_room_current_teacher_question(self, question: str) -> bool:
         q = self._normalize_text(question)
         return "qui enseigne" in q and "salle" in q and self._question_mentions_now(question)
+
+    def _is_room_schedule_question(self, question: str) -> bool:
+        return self._is_schedule_intent(question) and bool(self._extract_room_candidate(question))
 
     def _is_available_rooms_now_question(self, question: str) -> bool:
         q = self._normalize_text(question)
@@ -1316,6 +1925,52 @@ class SQLAgent:
         sql += " ) ORDER BY sa.nom;"
         return sql, params
 
+    def _room_schedule_sql(self, question: str, context: dict) -> Tuple[str, Dict[str, Any]]:
+        room_name = self._extract_room_candidate(question) or ""
+        requested_day = self._extract_requested_day(question, context)
+        sql = """
+        SELECT
+            c.nom AS classe,
+            m.nom AS matiere,
+            p.nom_complet AS professeur,
+            sa.nom AS salle,
+            s.jour,
+            s.heure_debut,
+            s.heure_fin
+        FROM seances s
+        JOIN emplois_versions v ON v.id = s.version_id AND v.actif = true AND v.classe_id = s.classe_id
+        JOIN salles sa ON sa.id = s.salle_id
+        LEFT JOIN classes c ON c.id = s.classe_id
+        LEFT JOIN matieres m ON m.id = s.matiere_id
+        LEFT JOIN professeurs p ON p.id = s.professeur_id
+        WHERE REPLACE(REPLACE(LOWER(sa.nom), ' ', ''), '-', '') = :room_name
+        """
+        params: Dict[str, Any] = {"room_name": self._room_key(room_name)}
+        if requested_day:
+            sql += " AND LOWER(s.jour) = LOWER(:target_day)\n"
+            params["target_day"] = requested_day
+        requested_periode = self._schedule_periode_name(question, context)
+        if requested_periode and context.get("semestre_id"):
+            sql += """
+            AND s.periode_id = (
+                SELECT p.id
+                FROM periodes p
+                WHERE p.semestre_id = :semester_id
+                  AND UPPER(p.nom) = :periode_nom
+                LIMIT 1
+            )\n
+            """
+            params["semester_id"] = int(context["semestre_id"])
+            params["periode_nom"] = requested_periode
+
+        sql += (
+            " ORDER BY CASE LOWER(s.jour) "
+            "WHEN 'lundi' THEN 1 WHEN 'mardi' THEN 2 WHEN 'mercredi' THEN 3 "
+            "WHEN 'jeudi' THEN 4 WHEN 'vendredi' THEN 5 WHEN 'samedi' THEN 6 "
+            "WHEN 'dimanche' THEN 7 ELSE 8 END, s.heure_debut, s.heure_fin;"
+        )
+        return sql, params
+
     def _is_prof_location_question(self, question: str) -> bool:
         q = self._normalize_text(question)
         if not self._extract_prof_candidate(question):
@@ -1327,7 +1982,7 @@ class SQLAgent:
         prof = self._extract_prof_candidate(question)
         if prof:
             return prof
-        if not self._is_schedule_intent(question) or self._extract_class_candidate(question):
+        if not self._is_schedule_intent(question) or self._extract_class_candidate(question) or self._extract_room_candidate(question):
             return None
 
         match = re.search(
@@ -1339,9 +1994,7 @@ class SQLAgent:
             return None
 
         candidate = match.group(1).strip()
-        if self._teacher_prof_exists_in_db(candidate) or self._prof_exists_in_db(candidate):
-            return candidate
-        return None
+        return candidate if self._is_valid_prof_candidate_text(candidate) else None
 
     def _is_prof_schedule_question(self, question: str) -> bool:
         return self._is_schedule_intent(question) and bool(self._extract_schedule_prof_candidate(question)) and not bool(
@@ -1371,8 +2024,9 @@ class SQLAgent:
 
     def _prof_location_sql(self, question: str, context: dict) -> Tuple[str, Dict[str, Any]]:
         prof_name = self._extract_prof_candidate(question) or ""
+        prof_name = self._resolve_professor_name(prof_name) or prof_name
         if self._teacher_prof_exists_in_db(prof_name):
-            prof_condition = self._professor_match_condition(prof_name, "te.professeur_nom_complet") or "1=0"
+            prof_condition = self._best_professor_match_condition(prof_name, "te.professeur_nom_complet") or "1=0"
             requested_day = self._extract_requested_day(question, context)
             target_day = requested_day or context.get("jour_actuel") or DAY_MAP_ISO[self._context_date(context).isoweekday()]
             restrict_to_now = self._question_mentions_now(question) or not requested_day
@@ -1406,10 +2060,10 @@ class SQLAgent:
                 sql += " AND UPPER(te.periode_nom) = :periode_nom\n"
                 params["periode_nom"] = str(context["periode"]).upper()
 
-            sql += " ORDER BY te.heure_debut, te.salle_nom;"
+            sql += " ORDER BY salle;"
             return sql, params
 
-        prof_condition = self._professor_match_condition(prof_name) or "1=0"
+        prof_condition = self._best_professor_match_condition(prof_name) or "1=0"
         requested_day = self._extract_requested_day(question, context)
         target_day = requested_day or context.get("jour_actuel") or DAY_MAP_ISO[self._context_date(context).isoweekday()]
         restrict_to_now = self._question_mentions_now(question) or not requested_day
@@ -1448,13 +2102,14 @@ class SQLAgent:
             sql += " AND s.periode_id = :periode_id\n"
             params["periode_id"] = int(context["periode_id"])
 
-        sql += " ORDER BY s.heure_debut, sa.nom;"
+        sql += " ORDER BY salle;"
         return sql, params
 
     def _prof_class_sql(self, question: str, context: dict) -> Tuple[str, Dict[str, Any]]:
         prof_name = self._extract_prof_candidate(question) or ""
+        prof_name = self._resolve_professor_name(prof_name) or prof_name
         if self._teacher_prof_exists_in_db(prof_name):
-            prof_condition = self._professor_match_condition(prof_name, "te.professeur_nom_complet") or "1=0"
+            prof_condition = self._best_professor_match_condition(prof_name, "te.professeur_nom_complet") or "1=0"
             requested_day = self._extract_requested_day(question, context)
             target_day = requested_day or context.get("jour_actuel") or DAY_MAP_ISO[self._context_date(context).isoweekday()]
             restrict_to_now = self._question_mentions_now(question) or not requested_day
@@ -1478,7 +2133,7 @@ class SQLAgent:
             sql += " ORDER BY te.heure_debut, te.classe_nom;"
             return sql, params
 
-        prof_condition = self._professor_match_condition(prof_name) or "1=0"
+        prof_condition = self._best_professor_match_condition(prof_name) or "1=0"
         requested_day = self._extract_requested_day(question, context)
         target_day = requested_day or context.get("jour_actuel") or DAY_MAP_ISO[self._context_date(context).isoweekday()]
         restrict_to_now = self._question_mentions_now(question) or not requested_day
@@ -1505,8 +2160,9 @@ class SQLAgent:
 
     def _prof_current_course_sql(self, question: str, context: dict) -> Tuple[str, Dict[str, Any]]:
         prof_name = self._extract_prof_candidate(question) or ""
+        prof_name = self._resolve_professor_name(prof_name) or prof_name
         if self._teacher_prof_exists_in_db(prof_name):
-            prof_condition = self._professor_match_condition(prof_name, "te.professeur_nom_complet") or "1=0"
+            prof_condition = self._best_professor_match_condition(prof_name, "te.professeur_nom_complet") or "1=0"
             sql = f"""
             SELECT DISTINCT te.matiere_nom AS matiere, te.classe_nom AS classe, te.salle_nom AS salle, te.heure_debut, te.heure_fin
             FROM emplois_enseignants_seances te
@@ -1529,7 +2185,7 @@ class SQLAgent:
             sql += " ORDER BY te.heure_debut;"
             return sql, params
 
-        prof_condition = self._professor_match_condition(prof_name) or "1=0"
+        prof_condition = self._best_professor_match_condition(prof_name) or "1=0"
         sql = f"""
         SELECT DISTINCT m.nom AS matiere, c.nom AS classe, sa.nom AS salle, s.heure_debut, s.heure_fin
         FROM seances s
@@ -1556,8 +2212,9 @@ class SQLAgent:
 
     def _prof_has_course_sql(self, question: str, context: dict) -> Tuple[str, Dict[str, Any]]:
         prof_name = self._extract_prof_candidate(question) or ""
+        prof_name = self._resolve_professor_name(prof_name) or prof_name
         if self._teacher_prof_exists_in_db(prof_name):
-            prof_condition = self._professor_match_condition(prof_name, "te.professeur_nom_complet") or "1=0"
+            prof_condition = self._best_professor_match_condition(prof_name, "te.professeur_nom_complet") or "1=0"
             requested_day = self._extract_requested_day(question, context)
             target_day = requested_day or context.get("jour_actuel") or DAY_MAP_ISO[self._context_date(context).isoweekday()]
             sql = f"""
@@ -1577,7 +2234,7 @@ class SQLAgent:
             sql += ";"
             return sql, params
 
-        prof_condition = self._professor_match_condition(prof_name) or "1=0"
+        prof_condition = self._best_professor_match_condition(prof_name) or "1=0"
         requested_day = self._extract_requested_day(question, context)
         target_day = requested_day or context.get("jour_actuel") or DAY_MAP_ISO[self._context_date(context).isoweekday()]
         sql = f"""
@@ -1822,8 +2479,21 @@ class SQLAgent:
         if self._is_room_current_teacher_question(question):
             room_name = self._extract_room_candidate(question) or ""
             if room_name and not self._room_exists_in_db(room_name):
-                return f"Je ne trouve pas la salle '{room_name}' dans la base de donnees."
+                return self._room_not_found_message(room_name)
             return f"La salle {room_name} est vide actuellement." if room_name else "Aucune salle correspondante n'a ete trouvee."
+
+        if self._is_room_schedule_question(question):
+            room_name = self._extract_room_candidate(question) or ""
+            if room_name and not self._room_exists_in_db(room_name):
+                return self._room_not_found_message(room_name)
+            requested_day = self._extract_requested_day(question, context)
+            if requested_day:
+                return f"Aucun cours trouve pour la salle {room_name} {requested_day.lower()}."
+            periode = context.get("periode")
+            semestre = context.get("semestre")
+            if semestre and periode:
+                return f"Aucun cours trouve pour la salle {room_name} dans la periode active {semestre}/{periode}."
+            return f"Aucun cours trouve pour la salle {room_name}."
 
         if self._is_available_rooms_now_question(question):
             return "Aucune salle libre n'a ete trouvee actuellement."
@@ -1834,10 +2504,23 @@ class SQLAgent:
                 return f"Aucune salle libre n'a ete trouvee {requested_day}."
             return "Aucune salle libre n'a ete trouvee pour ce jour."
 
+        if self._is_class_schedule_question(question):
+            cls = self._extract_class_candidate(question) or ""
+            cls = self._normalize_class_aliases(cls, context)
+            requested_day = self._extract_requested_day(question, context)
+            if requested_day:
+                return f"Aucun cours trouve pour la classe {cls} {requested_day.lower()}."
+            periode_id = self._class_schedule_period_id(question, context)
+            semestre = context.get("semestre")
+            periode = context.get("periode")
+            if periode_id and semestre and periode:
+                return f"Aucun cours trouve pour la classe {cls} dans la periode active {semestre}/{periode}."
+            return f"Aucun cours trouve pour la classe {cls}."
+
         prof_name = self._extract_schedule_prof_candidate(question) or self._extract_prof_candidate(question)
         if self._is_prof_class_question(question):
             if prof_name and not self._prof_exists_in_db(prof_name):
-                return f"Je ne trouve pas le professeur '{prof_name}' dans la base de donnees."
+                return self._prof_not_found_message(prof_name)
             requested_day = self._extract_requested_day(question, context)
             if requested_day:
                 return f"Aucune classe n'a ete trouvee pour {prof_name} {requested_day.lower()}."
@@ -1845,7 +2528,7 @@ class SQLAgent:
 
         if self._is_prof_location_question(question):
             if prof_name and not self._prof_exists_in_db(prof_name):
-                return f"Je ne trouve pas le professeur '{prof_name}' dans la base de donnees."
+                return self._prof_not_found_message(prof_name)
             requested_day = self._extract_requested_day(question, context)
             if requested_day:
                 return f"Aucune salle n'a ete trouvee pour {prof_name} {requested_day.lower()}."
@@ -1853,12 +2536,12 @@ class SQLAgent:
 
         if self._is_prof_current_course_question(question):
             if prof_name and not self._prof_exists_in_db(prof_name):
-                return f"Je ne trouve pas le professeur '{prof_name}' dans la base de donnees."
+                return self._prof_not_found_message(prof_name)
             return f"{prof_name} n'enseigne aucun cours en ce moment." if prof_name else "Aucun cours n'est en cours pour ce professeur."
 
         if self._is_prof_has_course_question(question):
             if prof_name and not self._prof_exists_in_db(prof_name):
-                return f"Je ne trouve pas le professeur '{prof_name}' dans la base de donnees."
+                return self._prof_not_found_message(prof_name)
             requested_day = self._extract_requested_day(question, context)
             if requested_day:
                 return f"Non, {prof_name} n'a pas de cours {requested_day.lower()}."
@@ -1914,6 +2597,7 @@ class SQLAgent:
         if (
             self._is_calendar_question(question)
             or self._is_room_current_teacher_question(question)
+            or self._is_room_schedule_question(question)
             or self._is_available_rooms_question(question)
             or self._is_available_rooms_now_question(question)
             or self._is_prof_schedule_question(question)
@@ -1926,8 +2610,11 @@ class SQLAgent:
 
         prof = self._extract_prof_candidate(question)
         if prof:
+            confirmation = self._professor_confirmation_message(prof)
+            if confirmation:
+                return confirmation
             if not self._prof_exists_in_db(prof):
-                return f"Je ne trouve pas le professeur '{prof}' dans la base de donnees."
+                return self._prof_not_found_message(prof)
             return None
 
         if not self._needs_class(question):
@@ -1971,6 +2658,13 @@ class SQLAgent:
             sql_query, params = self._room_current_teacher_sql(question, context)
             return self._exec_and_format(question, sql_query, params, context)
 
+        if self._is_room_schedule_question(question):
+            room_name = self._extract_room_candidate(question) or ""
+            if room_name and not self._room_exists_in_db(room_name):
+                return self._room_not_found_message(room_name)
+            sql_query, params = self._room_schedule_sql(question, context)
+            return self._exec_and_format(question, sql_query, params, context)
+
         if self._is_available_rooms_now_question(question):
             sql_query, params = self._available_rooms_now_sql(context)
             return self._exec_and_format(question, sql_query, params, context)
@@ -1981,38 +2675,64 @@ class SQLAgent:
 
         if self._is_prof_class_question(question):
             prof = self._extract_prof_candidate(question)
+            confirmation = self._professor_confirmation_message(prof or "")
+            if confirmation:
+                return confirmation
             if prof and not self._prof_exists_in_db(prof):
-                return f"Je ne trouve pas le professeur '{prof}' dans la base de donnees."
+                return self._prof_not_found_message(prof)
             sql_query, params = self._prof_class_sql(question, context)
             return self._exec_and_format(question, sql_query, params, context)
 
         if self._is_prof_schedule_question(question):
             prof = self._extract_schedule_prof_candidate(question) or self._extract_prof_candidate(question)
+            confirmation = self._professor_confirmation_message(prof or "")
+            if confirmation:
+                return confirmation
             if prof and not self._prof_exists_in_db(prof):
-                return f"Je ne trouve pas le professeur '{prof}' dans la base de donnees."
+                return self._prof_not_found_message(prof)
             sql_query, params = self._teacher_prof_schedule_sql(question, context) if self._teacher_prof_exists_in_db(prof or "") else ("", {})
             if sql_query:
                 return self._exec_and_format(question, sql_query, params, context)
 
         if self._is_prof_location_question(question):
             prof = self._extract_prof_candidate(question)
+            confirmation = self._professor_confirmation_message(prof or "")
+            if confirmation:
+                return confirmation
             if prof and not self._prof_exists_in_db(prof):
-                return f"Je ne trouve pas le professeur '{prof}' dans la base de donnees."
+                return self._prof_not_found_message(prof)
             sql_query, params = self._prof_location_sql(question, context)
             return self._exec_and_format(question, sql_query, params, context)
 
         if self._is_prof_current_course_question(question):
             prof = self._extract_prof_candidate(question)
+            confirmation = self._professor_confirmation_message(prof or "")
+            if confirmation:
+                return confirmation
             if prof and not self._prof_exists_in_db(prof):
-                return f"Je ne trouve pas le professeur '{prof}' dans la base de donnees."
+                return self._prof_not_found_message(prof)
             sql_query, params = self._prof_current_course_sql(question, context)
             return self._exec_and_format(question, sql_query, params, context)
 
         if self._is_prof_has_course_question(question):
             prof = self._extract_prof_candidate(question)
+            confirmation = self._professor_confirmation_message(prof or "")
+            if confirmation:
+                return confirmation
             if prof and not self._prof_exists_in_db(prof):
-                return f"Je ne trouve pas le professeur '{prof}' dans la base de donnees."
+                return self._prof_not_found_message(prof)
             sql_query, params = self._prof_has_course_sql(question, context)
+            return self._exec_and_format(question, sql_query, params, context)
+
+        if self._is_class_schedule_question(question):
+            cls = self._extract_class_candidate(question) or ""
+            cls = self._normalize_class_aliases(cls, context)
+            if context.get("semestre_id") and not self._class_exists_in_db(cls, context):
+                return (
+                    f"Je ne trouve pas la classe '{cls}' dans le semestre actuel ({context.get('semestre','?')}). "
+                    "Verifiez le nom (ex: '1 TIC 2') ou precisez le semestre (S1/S2)."
+                )
+            sql_query, params = self._class_schedule_sql(question, context)
             return self._exec_and_format(question, sql_query, params, context)
 
         if self._is_university_general_question(question):

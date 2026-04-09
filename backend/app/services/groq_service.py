@@ -75,7 +75,8 @@ class GroqService:
     def _normalize_room_name(self, value: Any) -> str:
         text = self._repair_text_encoding(str(value or ""))
         text = re.sub(r"\s+", " ", text).strip().upper()
-        text = re.sub(r"\bC\s+(\d{2})\b", r"C\1", text)
+        text = re.sub(r"\b([A-Z])\s+(\d{2})\b", r"\1\2", text)
+        text = re.sub(r"\b([A-Z])\s*0?(\d)\b", lambda match: f"{match.group(1)}{int(match.group(2)):02d}", text)
         text = re.sub(r"\bTEL-TCOM1\b", "TEL-TCOM 1", text)
         text = re.sub(r"\bEL-CI\s+AUTO\b", "EL-CI AUTO", text)
         text = re.sub(r"\s*/\s*", " / ", text)
@@ -164,10 +165,27 @@ class GroqService:
             return None
 
     def _extract_room_name(self, question: str) -> Optional[str]:
-        match = re.search(r"\bsalle\s+([A-Za-z0-9][A-Za-z0-9 ]*)\b", question or "", flags=re.IGNORECASE)
-        if not match:
-            return None
-        return self._normalize_room_name(match.group(1))
+        question_text = question or ""
+        patterns = [
+            r"\bsalle\s+([A-Za-z0-9][A-Za-z0-9 ]*)\b",
+            r"\bemploi(?:s)?\s+(?:du|de)\s+temps\s+de\s+([A-Za-z]{1,6}\s*0?\d{1,2})\b",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, question_text, flags=re.IGNORECASE)
+            if not match:
+                continue
+            candidate = re.sub(
+                r"\b(lundi|mardi|mercredi|jeudi|vendredi|samedi|dimanche|aujourd'hui|aujourdhui|demain|hier|maintenant|actuellement|mtn)\b.*$",
+                "",
+                match.group(1),
+                flags=re.IGNORECASE,
+            ).strip()
+            normalized = self._normalize_room_name(candidate)
+            if re.fullmatch(r"[A-Z][0-9]{2}", normalized) or re.fullmatch(r"[A-Z]{2,}[0-9]{1,2}", normalized):
+                return normalized
+            if pattern == patterns[0]:
+                return normalized
+        return None
 
     def _format_lookup_response(self, question: str, data: list) -> Optional[str]:
         if not data:

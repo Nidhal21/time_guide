@@ -22,6 +22,21 @@ from load_data import import_emplois_du_temps, import_room_emplois_du_temps, imp
 
 
 UPLOAD_ROOT = PROJECT_ROOT / "backend" / "uploads"
+CLASS_OWNER_RE = re.compile(
+    r"^(?:\d+\s+(?:ING|TIC|LTIC|MP|MR)\b.*|\d(?:GII|GEC|GT|IDSD|INFO|TELECOM)\d)$",
+    re.IGNORECASE,
+)
+ROOM_OWNER_RE = re.compile(
+    r"^(?:[A-Z]{1,4}\s*\d{1,3}|LAB(?:\s+\d+)?|INF[- ][A-Z0-9 ]+|TEL[- ][A-Z0-9 ]+|EL[- ][A-Z0-9 ]+|II[- ][A-Z0-9 ]+|PRIMATEC)$",
+    re.IGNORECASE,
+)
+SEMESTER_RE = re.compile(r"\bsemestre\s*[-: ]*\s*([12])\b|\bS\s*([12])\b", re.IGNORECASE)
+AUDIENCE_LABELS = {
+    "etudiants": "emplois etudiants",
+    "enseignants": "emplois enseignants",
+    "salles": "emplois des salles",
+    "calendrier": "calendrier universitaire",
+}
 
 
 @dataclass(frozen=True)
@@ -114,6 +129,155 @@ def _extract_workbook_metadata(file_path: Path) -> Dict[str, object]:
         "sheet_count": len(xls.sheet_names),
         "sheet_preview": xls.sheet_names[:4],
     }
+
+
+def _compact_spaces(value: object) -> str:
+    return re.sub(r"\s+", " ", str(value or "").strip())
+
+
+def _norm_cell(value: object) -> str:
+    text_value = _compact_spaces(value)
+    return "" if text_value.lower() in {"", "nan", "none"} else text_value
+
+
+def _extract_named_header(sheet_df: pd.DataFrame, label: str) -> Optional[str]:
+    max_r = min(25, sheet_df.shape[0])
+    max_c = min(20, sheet_df.shape[1])
+    for r in range(max_r):
+        for c in range(max_c):
+            value = _norm_cell(sheet_df.iat[r, c])
+            if not value:
+                continue
+            match = re.search(rf"\b{label}\s*:\s*(.+)$", value, flags=re.IGNORECASE)
+            if match:
+                return _compact_spaces(match.group(1))
+    return None
+
+
+def _top_sheet_text(sheet_df: pd.DataFrame) -> str:
+    max_r = min(12, sheet_df.shape[0])
+    max_c = min(20, sheet_df.shape[1])
+    values: List[str] = []
+    for r in range(max_r):
+        for c in range(max_c):
+            value = _norm_cell(sheet_df.iat[r, c])
+            if value:
+                values.append(value)
+    return "\n".join(values)
+
+
+def _looks_like_class_owner(value: str) -> bool:
+    return bool(CLASS_OWNER_RE.match(_compact_spaces(value)))
+
+
+def _looks_like_room_owner(value: str) -> bool:
+    cleaned = _compact_spaces(re.sub(r"^salle\s*:?\s*", "", value or "", flags=re.IGNORECASE))
+    if not cleaned or _looks_like_class_owner(cleaned):
+        return False
+    return bool(ROOM_OWNER_RE.match(cleaned))
+
+
+def _looks_like_professor_owner(value: str) -> bool:
+    cleaned = _compact_spaces(re.sub(r"^professeur\s*:?\s*", "", value or "", flags=re.IGNORECASE))
+    if not cleaned or _looks_like_class_owner(cleaned) or _looks_like_room_owner(cleaned):
+        return False
+    if re.search(r"\d", cleaned):
+        return False
+    alpha_tokens = [token for token in re.split(r"[\s'-]+", cleaned) if token and re.search(r"[A-Za-zÀ-ÿ]", token)]
+    return len(alpha_tokens) >= 2
+
+
+def _detect_semester_in_text(text_value: str) -> Optional[int]:
+    for match in SEMESTER_RE.finditer(text_value or ""):
+        captured = match.group(1) or match.group(2)
+        if captured in {"1", "2"}:
+            return int(captured)
+    return None
+
+
+def _detect_workbook_signature(file_path: Path, max_sheets: int = 3) -> Dict[str, object]:
+    xls = pd.ExcelFile(file_path)
+    sampled_sheets = xls.sheet_names[:max_sheets]
+    scores = {"etudiants": 0, "enseignants": 0, "salles": 0}
+    semester_hits: List[int] = []
+
+    for sheet_name in sampled_sheets:
+        sheet_df = pd.read_excel(file_path, sheet_name=sheet_name, header=None)
+        if sheet_df is None or sheet_df.empty:
+            continue
+
+        top_text = _top_sheet_text(sheet_df)
+        semester = _detect_semester_in_text(top_text) or _detect_semester_in_text(sheet_name)
+        if semester:
+            semester_hits.append(semester)
+
+        class_header = _extract_named_header(sheet_df, "classe")
+        professor_header = _extract_named_header(sheet_df, "professeur")
+        room_header = _extract_named_header(sheet_df, "salle")
+
+        if class_header:
+            scores["etudiants"] += 8
+        if professor_header:
+            scores["enseignants"] += 8
+        if room_header:
+            scores["salles"] += 8
+
+        candidate_values = [class_header, professor_header, room_header, sheet_name]
+        for candidate in [value for value in candidate_values if value]:
+            if _looks_like_class_owner(candidate):
+                scores["etudiants"] += 3
+            if _looks_like_professor_owner(candidate):
+                scores["enseignants"] += 3
+            if _looks_like_room_owner(candidate):
+                scores["salles"] += 3
+
+    detected_audience = None
+    best_score = max(scores.values()) if scores else 0
+    if best_score > 0:
+        leaders = [audience for audience, score in scores.items() if score == best_score]
+        if len(leaders) == 1:
+            detected_audience = leaders[0]
+
+    detected_semester = None
+    if semester_hits:
+        detected_semester = max(set(semester_hits), key=semester_hits.count)
+    else:
+        detected_semester = _detect_semester_in_text(file_path.name)
+
+    return {
+        "detected_audience": detected_audience,
+        "detected_semester": detected_semester,
+        "scores": scores,
+        "sampled_sheets": sampled_sheets,
+    }
+
+
+def _validate_workbook_matches_category(saved_path: Path, category: UploadCategory) -> Dict[str, object]:
+    if category.audience == "calendrier":
+        return {
+            "detected_audience": "calendrier",
+            "detected_semester": None,
+            "scores": {},
+            "sampled_sheets": [],
+        }
+
+    detected = _detect_workbook_signature(saved_path)
+    detected_audience = detected.get("detected_audience")
+    detected_semester = detected.get("detected_semester")
+
+    if detected_audience and detected_audience != category.audience:
+        detected_label = AUDIENCE_LABELS.get(str(detected_audience), str(detected_audience))
+        raise ValueError(
+            f"Le fichier '{saved_path.name}' ressemble a {detected_label}, mais il a ete depose dans la categorie '{category.label}'."
+        )
+
+    if detected_semester and category.semester_id and int(detected_semester) != int(category.semester_id):
+        raise ValueError(
+            f"Le fichier '{saved_path.name}' correspond au semestre S{int(detected_semester)}, "
+            f"mais il a ete depose dans la categorie '{category.label}'."
+        )
+
+    return detected
 
 
 def _save_upload(upload, category: UploadCategory) -> Dict[str, object]:
@@ -311,6 +475,7 @@ def process_uploads(db: Session, uploads_by_key: Dict[str, object]) -> Dict[str,
         try:
             saved = _save_upload(upload, category)
             metadata = _extract_workbook_metadata(saved["path"])
+            detected = _validate_workbook_matches_category(saved["path"], category)
             import_result = _apply_database_import(category, saved["path"], db)
             parsed_session_count = import_result.get("parsed_session_count")
             message = str(import_result["message"])
@@ -325,6 +490,8 @@ def process_uploads(db: Session, uploads_by_key: Dict[str, object]) -> Dict[str,
                     "size_label": saved["size_label"],
                     "sheet_count": metadata["sheet_count"],
                     "sheet_preview": metadata["sheet_preview"],
+                    "detected_audience": detected.get("detected_audience"),
+                    "detected_semester": detected.get("detected_semester"),
                     "db_updates": category.db_updates,
                     "parsed_session_count": parsed_session_count,
                     "message": message,

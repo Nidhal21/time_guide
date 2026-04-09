@@ -4,6 +4,7 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 from app.services.groq_service import groq_service
+from app.services.sql_agent import SQLAgent
 from main import app
 
 
@@ -96,6 +97,30 @@ class ChatApiWeekdaySmokeTests(unittest.TestCase):
         body = response.json()["response"]
         self.assertIn("Je ne trouve pas le professeur", body)
 
+    def test_unknown_professor_schedule_returns_similar_names(self):
+        with patch(
+            "app.services.sql_agent.get_current_academic_context",
+            return_value={"date_actuelle": "2026-03-30", "jour_actuel": "Lundi", "semestre": "S2", "periode": "P2"},
+        ), patch.object(SQLAgent, "_prof_exists_in_db", return_value=False), patch.object(
+            SQLAgent,
+            "_find_similar_professors",
+            return_value=["ALI KHLFALLAH", "ALI KHALFEDIN"],
+        ):
+            response = self.client.post(
+                "/api/chat",
+                json={
+                    "message": "emploi de temps de mr ali khalfeoui",
+                    "user_role": "student",
+                    "history": [],
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()["response"]
+        self.assertIn("ali khalfeoui", body.lower())
+        self.assertIn("ALI KHLFALLAH", body)
+        self.assertIn("ALI KHALFEDIN", body)
+
     def test_calendar_no_vacation_today_returns_explicit_negative_message(self):
         original_enabled = getattr(groq_service, "enabled", False)
         groq_service.enabled = True
@@ -151,6 +176,24 @@ class ChatApiWeekdaySmokeTests(unittest.TestCase):
         body = response.json()["response"]
         self.assertNotIn("Quelle est votre classe", body)
         self.assertIn("salles disponibles", body)
+
+    def test_new_explicit_class_question_does_not_reuse_previous_pending_class(self):
+        history = [
+            {"role": "user", "content": "emploi de temps de 2gec3"},
+            {"role": "assistant", "content": "Quelle est votre classe ?"},
+        ]
+        with patch("app.routes.chat.SQLAgent.process_question", side_effect=lambda self, question: question):
+            response = self.client.post(
+                "/api/chat",
+                json={
+                    "message": "emploi de temps de 1IDSD2",
+                    "user_role": "student",
+                    "history": history,
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["response"], "emploi de temps de 1IDSD2")
 
 
 if __name__ == "__main__":

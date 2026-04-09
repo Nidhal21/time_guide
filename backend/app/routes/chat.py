@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import List, Optional, Tuple
 import re
 from app.models.db_config import get_db
 from app.services.sql_agent import SQLAgent
@@ -22,7 +22,7 @@ class ChatResponse(BaseModel):
     response: str
 
 CLASS_PATTERN = re.compile(
-    r"\b(\d\s*(?:ING|TIC|LTIC|MP|MR)\s*[A-Z0-9\-]*\s*\d?)\b",
+    r"\b(?:\d\s*(?:(?:ING|TIC|LTIC|MP|MR)\s*[A-Z0-9\-]*\s*\d?|(?:GII|GEC|GT|IDSD|INFO|TELECOM)\s*\d)|\d(?:GII|GEC|GT|IDSD|INFO|TELECOM)\d)\b",
     re.IGNORECASE,
 )
 PROF_PATTERN = re.compile(
@@ -60,6 +60,35 @@ def _extract_pending_intent(history: list) -> Optional[str]:
             if history[i].role == "assistant" and any(t in history[i].content.lower() for t in ask_triggers):
                 if i > 0 and history[i - 1].role == "user":
                     return history[i - 1].content
+    return None
+
+def _extract_pending_request(history: list) -> Optional[Tuple[str, str, str]]:
+    if not history or len(history) < 2:
+        return None
+
+    class_triggers = ["quelle est votre classe", "pour quelle classe"]
+    professor_triggers = [
+        "quel professeur",
+        "voulez-vous dire",
+        "je ne suis pas sur du professeur",
+        "est ambigu",
+        "ressemble a",
+        "est proche de plusieurs professeurs",
+    ]
+
+    for i in range(len(history) - 1, -1, -1):
+        msg = history[i]
+        if msg.role != "assistant":
+            continue
+        content = (msg.content or "").lower()
+        if any(trigger in content for trigger in class_triggers):
+            if i > 0 and history[i - 1].role == "user":
+                return ("class", history[i - 1].content, msg.content)
+            break
+        if any(trigger in content for trigger in professor_triggers):
+            if i > 0 and history[i - 1].role == "user":
+                return ("professor", history[i - 1].content, msg.content)
+            break
     return None
 
 
@@ -116,16 +145,74 @@ def _likely_professor_followup(message: str) -> bool:
     ]
     return any(marker in q for marker in markers)
 
+def _looks_like_fresh_request(message: str) -> bool:
+    normalized = _normalize_for_intent(message)
+    if not normalized:
+        return False
+    if normalized in {"oui", "non", "ok", "daccord", "d accord", "yes", "no"}:
+        return False
+    return _likely_schedule_question(message) or _likely_professor_followup(message)
+
+def _extract_confirmed_professor(message: str, assistant_message: str) -> Optional[str]:
+    user_reply = re.sub(r"\s+", " ", (message or "")).strip()
+    if not user_reply:
+        return None
+
+    if user_reply.lower() in {"oui", "yes", "ok", "daccord", "d'accord"}:
+        assistant_text = assistant_message or ""
+        resembles_match = re.search(r"ressemble a\s+'([^']+)'", assistant_text, flags=re.IGNORECASE)
+        if resembles_match:
+            return resembles_match.group(1).strip()
+        direct_match = re.search(r"professeur\s+'([^']+)'", assistant_text, flags=re.IGNORECASE)
+        if direct_match:
+            return direct_match.group(1).strip()
+        quoted = re.findall(r"'([^']+)'", assistant_text)
+        if len(quoted) == 1:
+            return quoted[0].strip()
+        return None
+
+    return user_reply
+
+def _replace_professor_in_question(agent: SQLAgent, original_question: str, professor_name: str) -> str:
+    original_question = re.sub(r"\s+", " ", (original_question or "")).strip()
+    professor_name = re.sub(r"\s+", " ", (professor_name or "")).strip()
+    if not original_question or not professor_name:
+        return original_question or professor_name
+
+    existing_prof = agent._extract_schedule_prof_candidate(original_question) or agent._extract_prof_candidate(original_question)
+    if existing_prof:
+        return re.sub(re.escape(existing_prof), professor_name, original_question, count=1, flags=re.IGNORECASE)
+
+    normalized = _normalize_for_intent(original_question)
+    if _likely_schedule_question(original_question):
+        return f"emploi du temps de {professor_name}"
+    if "ou se trouve" in normalized or "dans quelle salle" in normalized or "ou est" in normalized:
+        return f"ou se trouve {professor_name}"
+    if "quelle classe" in normalized or "dans quelle classe" in normalized:
+        return f"dans quelle classe se trouve {professor_name}"
+    if "quel cours" in normalized or "quelle matiere" in normalized:
+        return f"quel cours fait {professor_name}"
+    if "a cours" in normalized:
+        return f"{professor_name} a cours aujourd'hui"
+    return f"{original_question} pour le professeur {professor_name}"
+
 @router.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest, db: Session = Depends(get_db)):
     agent = SQLAgent(db)
     user_class = re.sub(r"\s+", " ", (request.user_class or "")).strip() or None
 
-    # If bot just asked for class and user replied with one
-    pending_intent = _extract_pending_intent(request.history)
-    if pending_intent:
-        class_value = user_class or request.message
-        full_question = f"{pending_intent} pour la classe {class_value}"
+    pending_request = _extract_pending_request(request.history)
+    if pending_request and _looks_like_fresh_request(request.message):
+        pending_request = None
+
+    if pending_request:
+        request_kind, original_question, assistant_message = pending_request
+        if request_kind == "class":
+            class_value = user_class or request.message
+            full_question = f"{original_question} pour la classe {class_value}"
+        else:
+            selected_professor = _extract_confirmed_professor(request.message, assistant_message)
+            full_question = _replace_professor_in_question(agent, original_question, selected_professor or request.message)
     else:
         # Prefer explicit user_class from the request, then recent history.
         if user_class and not CLASS_PATTERN.search(request.message) and _likely_schedule_question(request.message):
