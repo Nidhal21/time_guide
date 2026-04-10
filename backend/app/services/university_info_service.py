@@ -15,6 +15,7 @@ from .groq_service import groq_service
 class UniversityInfoService:
     BASE_URL = "https://enetcom.rnu.tn/fr"
     ACTUALITES_URL = "https://enetcom.rnu.tn/fr/categories/1/actualites"
+    ABSENCES_URL = "https://enetcom.rnu.tn/fr/app/my-studies-absences"
     CACHE_TTL_SECONDS = 1800
     MAX_CONTEXT_CHARS = 12000
     STUDY_PLAN_URLS: Dict[str, str] = {
@@ -141,6 +142,19 @@ class UniversityInfoService:
         ]
         return any(marker in normalized_question for marker in markers)
 
+    def _is_absence_question(self, question: str) -> bool:
+        normalized_question = self._normalize_text(question)
+        markers = [
+            "absence",
+            "absences",
+            "avis d absence",
+            "avis de absence",
+            "justificatif d absence",
+            "justificatif absence",
+            "extranet",
+        ]
+        return any(marker in normalized_question for marker in markers)
+
     def _study_plan_keys_for_question(self, question: str) -> List[str]:
         normalized_question = self._normalize_text(question)
         if not any(marker in normalized_question for marker in ["plan", "etude", "etudes", "programme", "curriculum"]):
@@ -155,6 +169,8 @@ class UniversityInfoService:
             keys.append("gec")
         if re.search(r"\bgt\b", normalized_question) or "genie telecommunication" in normalized_question:
             keys.append("gt")
+        if not keys:
+            keys = ["gii", "gec", "idsd", "gt"]
         return list(dict.fromkeys(keys))
 
     def _study_plan_response(self, keys: List[str]) -> str:
@@ -169,6 +185,34 @@ class UniversityInfoService:
             lines.append(f"- {labels[key]} : {self.STUDY_PLAN_URLS[key]}")
         lines.extend(["", f"Source : {self.BASE_URL}"])
         return "\n".join(lines)
+
+    def _absence_response(self) -> str:
+        try:
+            response = self._session.get(self.ABSENCES_URL, timeout=20, allow_redirects=True)
+            final_url = str(response.url)
+            page_text = self._html_to_text(response.text or "")
+        except Exception as e:
+            print(f"University absences fetch error for {self.ABSENCES_URL}: {e}")
+            return (
+                "Je n'ai pas pu verifier la page des absences pour le moment. "
+                f"Vous pouvez essayer ici : {self.ABSENCES_URL}"
+            )
+
+        if "/login" in final_url.lower() or "se connecter" in page_text.lower():
+            return (
+                "Les avis d'absence sont disponibles sur l'espace extranet et necessitent une connexion etudiante. "
+                f"Si l'etudiant est connecte, il peut consulter la page suivante : {self.ABSENCES_URL} "
+                "Sinon, il sera redirige vers la page de connexion."
+            )
+
+        snippet = re.sub(r"\s+", " ", page_text).strip()[:700]
+        if snippet:
+            return (
+                "Voici ce que j'ai pu recuperer depuis la page des absences :\n"
+                f"{snippet}\n\nSource : {self.ABSENCES_URL}"
+            )
+
+        return f"La page des absences est disponible ici : {self.ABSENCES_URL}"
 
     def _extract_latest_news(self, limit: int = 6) -> List[Tuple[str, str]]:
         try:
@@ -245,6 +289,9 @@ class UniversityInfoService:
         study_plan_keys = self._study_plan_keys_for_question(question)
         if study_plan_keys:
             return self._study_plan_response(study_plan_keys)
+
+        if self._is_absence_question(question):
+            return self._absence_response()
 
         if self._is_news_question(question):
             news_items = self._extract_latest_news()

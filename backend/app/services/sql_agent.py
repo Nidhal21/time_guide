@@ -103,6 +103,14 @@ _PROFESSOR_DIRECTORY_CACHE: dict[str, Any] = {
     "reference_names": None,
     "all_names": None,
 }
+PROFESSOR_CONNECTOR_TOKENS = {
+    "ben",
+    "ibn",
+    "ould",
+    "bint",
+    "el",
+    "al",
+}
 
 
 class SQLAgent:
@@ -184,6 +192,41 @@ class SQLAgent:
             _PROFESSOR_DIRECTORY_CACHE["all_names"] = list(all_names)
             _PROFESSOR_DIRECTORY_CACHE["reference_names"] = list(reference_names)
 
+    def _split_professor_name_variants(self, value: str) -> list[str]:
+        variants = []
+        for part in re.split(r"\s*/\s*", value or ""):
+            cleaned = self._clean_professor_display_name(part)
+            if cleaned:
+                variants.append(cleaned)
+        return list(dict.fromkeys(variants))
+
+    def _professor_name_signature(self, value: str) -> str:
+        tokens = self._professor_tokens_for_match(value)
+        return " ".join(sorted(tokens))
+
+    def _professor_display_rank(self, value: str) -> tuple[int, int, int, int]:
+        cleaned = self._clean_professor_display_name(value)
+        tokens = self._professor_tokens_for_match(cleaned)
+        full_tokens = sum(1 for token in tokens if len(token) > 1 and token not in PROFESSOR_CONNECTOR_TOKENS)
+        return (
+            1 if "." not in cleaned else 0,
+            1 if "/" not in cleaned else 0,
+            full_tokens,
+            len(cleaned),
+        )
+
+    def _dedupe_professor_display_names(self, names: list[str]) -> list[str]:
+        best_by_signature: dict[str, str] = {}
+        for name in names:
+            cleaned = self._clean_professor_display_name(name)
+            if not cleaned:
+                continue
+            signature = self._professor_name_signature(cleaned) or self._norm(cleaned)
+            current_best = best_by_signature.get(signature)
+            if current_best is None or self._professor_display_rank(cleaned) > self._professor_display_rank(current_best):
+                best_by_signature[signature] = cleaned
+        return sorted(best_by_signature.values(), key=lambda item: self._normalize_text(item))
+
     def _load_reference_professor_names_from_db(self) -> list[str]:
         if not self.db:
             return []
@@ -191,20 +234,38 @@ class SQLAgent:
             rows = self.db.execute(
                 text(
                     """
-                    SELECT DISTINCT p.nom_complet
-                    FROM professeurs p
-                    WHERE p.nom_complet IS NOT NULL AND TRIM(p.nom_complet) <> ''
-                    ORDER BY p.nom_complet
+                    SELECT DISTINCT te.professeur_nom_complet
+                    FROM emplois_enseignants_seances te
+                    WHERE te.professeur_nom_complet IS NOT NULL AND TRIM(te.professeur_nom_complet) <> ''
+                    ORDER BY te.professeur_nom_complet
                     """
                 )
             ).fetchall()
         except Exception:
-            return []
-        return [
-            self._clean_professor_display_name(str(row[0] or "").strip())
-            for row in rows
-            if str(row[0] or "").strip()
-        ]
+            rows = []
+
+        reference_names: list[str] = []
+        for row in rows:
+            reference_names.extend(self._split_professor_name_variants(str(row[0] or "").strip()))
+
+        if not reference_names:
+            try:
+                rows = self.db.execute(
+                    text(
+                        """
+                        SELECT DISTINCT p.nom_complet
+                        FROM professeurs p
+                        WHERE p.nom_complet IS NOT NULL AND TRIM(p.nom_complet) <> ''
+                        ORDER BY p.nom_complet
+                        """
+                    )
+                ).fetchall()
+            except Exception:
+                rows = []
+            for row in rows:
+                reference_names.extend(self._split_professor_name_variants(str(row[0] or "").strip()))
+
+        return self._dedupe_professor_display_names(reference_names)
 
     def _load_all_professor_names_from_db(self) -> list[str]:
         if not self.db:
@@ -230,7 +291,7 @@ class SQLAgent:
         names = []
         for row in rows:
             names.extend(self._candidate_professor_names(str(row[0] or "").strip()))
-        return list(dict.fromkeys(name for name in names if name))
+        return self._dedupe_professor_display_names([name for name in names if name])
 
     def _collapse_repeated_letters(self, token: str) -> str:
         return re.sub(r"([a-z0-9])\1+", r"\1", token or "")
@@ -241,6 +302,16 @@ class SQLAgent:
             for part in re.split(r"[\s/-]+", value or "")
             if part.strip()
         ]
+
+    def _significant_professor_tokens(self, value: str) -> list[str]:
+        return [
+            token
+            for token in self._professor_tokens_for_match(value)
+            if token and token not in PROFESSOR_CONNECTOR_TOKENS
+        ]
+
+    def _has_professor_connector_token(self, value: str) -> bool:
+        return any(token in PROFESSOR_CONNECTOR_TOKENS for token in self._professor_tokens_for_match(value))
 
     def _string_similarity(self, left: str, right: str) -> float:
         left_value = left or ""
@@ -261,21 +332,27 @@ class SQLAgent:
         if not requested_tokens or not candidate_tokens:
             return 0.0
 
+        requested_significant = self._significant_professor_tokens(requested_name)
+        candidate_significant = self._significant_professor_tokens(candidate_name)
+        if not requested_significant or not candidate_significant:
+            return 0.0
+
         requested_joined = "".join(requested_tokens)
         candidate_joined = "".join(candidate_tokens)
         score = self._string_similarity(requested_joined, candidate_joined)
 
-        requested_surname = requested_tokens[-1]
-        surname_score = max(self._string_similarity(requested_surname, candidate_token) for candidate_token in candidate_tokens)
+        requested_surname = requested_significant[-1]
+        surname_score = max(self._string_similarity(requested_surname, candidate_token) for candidate_token in candidate_significant)
+        same_surname_initial = any(candidate_token[:1] == requested_surname[:1] for candidate_token in candidate_significant if candidate_token)
         score = max(score, surname_score)
 
         token_pair_score = 0.0
-        for requested_token in requested_tokens:
+        for requested_token in requested_significant:
             if len(requested_token) < 3:
                 continue
             candidate_scores = [
                 self._string_similarity(requested_token, candidate_token)
-                for candidate_token in candidate_tokens
+                for candidate_token in candidate_significant
                 if len(candidate_token) >= 3
             ]
             if not candidate_scores:
@@ -286,26 +363,46 @@ class SQLAgent:
             )
         score = max(score, token_pair_score)
 
-        common_tokens = set(requested_tokens) & set(candidate_tokens)
+        common_tokens = set(requested_significant) & set(candidate_significant)
         if common_tokens:
             score += 0.08 * (len(common_tokens) / max(len(set(requested_tokens)), len(set(candidate_tokens))))
-        if requested_tokens[0][0] == candidate_tokens[0][0]:
+        first_score = max(self._string_similarity(requested_significant[0], candidate_token) for candidate_token in candidate_significant)
+        if self._has_professor_connector_token(requested_name):
+            if self._has_professor_connector_token(candidate_name):
+                score += 0.08
+            else:
+                score -= 0.2
+        if same_surname_initial:
+            score += 0.06
+        elif len(requested_surname) >= 3:
+            score -= 0.14
+        if requested_significant[0][0] == candidate_significant[0][0]:
             score += 0.04
         if surname_score >= 0.72:
             score += 0.12
+        if first_score >= 0.88:
+            score += 0.08
+        elif first_score < 0.55:
+            score -= 0.18
+        if surname_score < 0.45:
+            score -= 0.28
+        if not common_tokens and surname_score < 0.55:
+            score -= 0.18
+        if " / " in candidate_name:
+            score -= 0.12
 
-        return min(score, 0.99)
+        return min(max(score, 0.0), 0.99)
 
     def _surname_similarity(self, requested_name: str, candidate_name: str) -> float:
-        requested_tokens = self._professor_tokens_for_match(requested_name)
-        candidate_tokens = self._professor_tokens_for_match(candidate_name)
+        requested_tokens = self._significant_professor_tokens(requested_name)
+        candidate_tokens = self._significant_professor_tokens(candidate_name)
         if not requested_tokens or not candidate_tokens:
             return 0.0
         return max(self._string_similarity(requested_tokens[-1], candidate_token) for candidate_token in candidate_tokens)
 
     def _is_relevant_professor_candidate(self, requested_name: str, candidate_name: str) -> bool:
-        requested_tokens = [token for token in self._professor_tokens_for_match(requested_name) if len(token) >= 2]
-        candidate_tokens = [token for token in self._professor_tokens_for_match(candidate_name) if len(token) >= 2]
+        requested_tokens = [token for token in self._significant_professor_tokens(requested_name) if len(token) >= 2]
+        candidate_tokens = [token for token in self._significant_professor_tokens(candidate_name) if len(token) >= 2]
         if not requested_tokens or not candidate_tokens:
             return False
 
@@ -319,12 +416,22 @@ class SQLAgent:
 
         surname_score = self._surname_similarity(requested_name, candidate_name)
         first_score = max(self._string_similarity(requested_tokens[0], candidate_token) for candidate_token in candidate_tokens)
-        has_secondary_overlap = any(
-            req == cand or req.startswith(cand) or cand.startswith(req)
+        same_surname_initial = any(candidate_token[:1] == requested_tokens[-1][:1] for candidate_token in candidate_tokens if candidate_token)
+        if self._has_professor_connector_token(requested_name) and not self._has_professor_connector_token(candidate_name) and surname_score < 0.72:
+            return False
+        overlapping_tokens = {
+            req
             for req in requested_tokens[1:]
             for cand in candidate_tokens
+            if req == cand or req.startswith(cand) or cand.startswith(req)
+        }
+        return (
+            surname_score >= 0.72
+            or (surname_score >= 0.58 and first_score >= 0.82)
+            or (first_score >= 0.9 and same_surname_initial and self._has_professor_connector_token(candidate_name))
+            or (first_score >= 0.9 and bool(overlapping_tokens))
+            or len(overlapping_tokens) >= 2
         )
-        return surname_score >= 0.72 or (surname_score >= 0.6 and first_score >= 0.8) or has_secondary_overlap
 
     def _rank_professor_candidates(self, prof_name: str, min_score: float = 0.58, limit: int = 3) -> list[str]:
         requested_key = "".join(self._normalized_token_parts(prof_name))
@@ -355,7 +462,34 @@ class SQLAgent:
 
         best_score = scored_matches[0][0]
         filtered = [item for item in scored_matches if item[0] >= max(min_score, best_score - 0.08)]
-        return [name for _, _, name in filtered[:limit]]
+        selected: list[tuple[str, str]] = []
+        for _, _, name in filtered:
+            suggestion_key = "".join(self._normalized_token_parts(self._clean_professor_display_name(name)))
+            if not suggestion_key:
+                continue
+
+            replaced = False
+            should_skip = False
+            for index, (existing_key, _) in enumerate(selected):
+                if suggestion_key == existing_key:
+                    should_skip = True
+                    break
+                if suggestion_key.startswith(existing_key) or existing_key.startswith(suggestion_key):
+                    if len(suggestion_key) > len(existing_key):
+                        selected[index] = (suggestion_key, name)
+                        replaced = True
+                    else:
+                        should_skip = True
+                    break
+
+            if should_skip:
+                continue
+            if not replaced:
+                selected.append((suggestion_key, name))
+            if len(selected) >= limit:
+                break
+
+        return [name for _, name in selected[:limit]]
 
     def _find_similar_professors(self, prof_name: str, limit: int = 3) -> list[str]:
         return self._rank_professor_candidates(prof_name, min_score=0.7, limit=limit)
@@ -750,6 +884,9 @@ class SQLAgent:
             "enetcom",
             "universite",
             "ecole",
+            "absence",
+            "absences",
+            "extranet",
             "actualite",
             "actualites",
             "nouveaute",
@@ -875,6 +1012,13 @@ class SQLAgent:
             return False
         return True
 
+    def _is_class_location_question(self, question: str) -> bool:
+        q = self._normalize_text(question)
+        if not self._extract_class_candidate(question):
+            return False
+        location_markers = ["ou se trouve", "ou est", "dans quelle salle", "salle"]
+        return "classe" in q and any(marker in q for marker in location_markers)
+
     def _class_schedule_period_id(self, question: str, context: dict) -> Optional[int]:
         q = (question or "").lower()
         want_p1 = bool(re.search(r"\bp\s*1\b", q))
@@ -949,6 +1093,36 @@ class SQLAgent:
             "WHEN 'jeudi' THEN 4 WHEN 'vendredi' THEN 5 WHEN 'samedi' THEN 6 "
             "WHEN 'dimanche' THEN 7 ELSE 8 END, s.heure_debut, s.heure_fin;"
         )
+        return sql, params
+
+    def _class_location_sql(self, question: str, context: dict) -> Tuple[str, Dict[str, Any]]:
+        cls = self._extract_class_candidate(question) or ""
+        cls = self._normalize_class_aliases(cls, context)
+        requested_day = self._extract_requested_day(question, context)
+        target_day = requested_day or context.get("jour_actuel") or DAY_MAP_ISO[self._context_date(context).isoweekday()]
+        restrict_to_now = self._question_mentions_now(question) or not requested_day
+
+        sql = """
+        SELECT c.nom AS classe, sa.nom AS salle, s.jour, s.heure_debut, s.heure_fin
+        FROM seances s
+        JOIN emplois_versions v ON v.id = s.version_id AND v.actif = true AND v.classe_id = s.classe_id
+        JOIN classes c ON c.id = s.classe_id
+        JOIN salles sa ON sa.id = s.salle_id
+        WHERE REPLACE(REPLACE(LOWER(c.nom), ' ', ''), '-', '') = :class_key
+          AND LOWER(s.jour) = LOWER(:target_day)
+        """
+        params: Dict[str, Any] = {
+            "class_key": self._class_key(cls),
+            "target_day": target_day,
+        }
+        if restrict_to_now:
+            sql += " AND :current_time >= s.heure_debut AND :current_time < s.heure_fin\n"
+            params["current_time"] = datetime.now().time().strftime("%H:%M:%S")
+        if context.get("periode_id"):
+            sql += " AND s.periode_id = :periode_id\n"
+            params["periode_id"] = int(context["periode_id"])
+
+        sql += " ORDER BY s.heure_debut, sa.nom;"
         return sql, params
 
     def _professor_match_condition(self, prof_name: str, field_sql: str = "p.nom_complet") -> Optional[str]:
@@ -1361,6 +1535,7 @@ class SQLAgent:
                 "séance" in q_lower,
                 "seance" in q_lower,
                 "j'ai cours" in q_lower,
+                ("classe" in q_lower and ("ou se trouve" in q_lower or "ou est" in q_lower or "dans quelle salle" in q_lower)),
                 "demain" in q_lower,
                 "aujourd" in q_lower,
                 any(day in q_lower for day in ["lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche"]),
@@ -2517,6 +2692,14 @@ class SQLAgent:
                 return f"Aucun cours trouve pour la classe {cls} dans la periode active {semestre}/{periode}."
             return f"Aucun cours trouve pour la classe {cls}."
 
+        if self._is_class_location_question(question):
+            cls = self._extract_class_candidate(question) or ""
+            cls = self._normalize_class_aliases(cls, context)
+            requested_day = self._extract_requested_day(question, context)
+            if requested_day:
+                return f"Aucune salle n'a ete trouvee pour la classe {cls} {requested_day.lower()}."
+            return f"La classe {cls} n'a pas de cours en ce moment."
+
         prof_name = self._extract_schedule_prof_candidate(question) or self._extract_prof_candidate(question)
         if self._is_prof_class_question(question):
             if prof_name and not self._prof_exists_in_db(prof_name):
@@ -2587,6 +2770,7 @@ class SQLAgent:
                 "cours" in normalized_question,
                 "seance" in normalized_question,
                 "j'ai cours" in normalized_question,
+                ("classe" in normalized_question and ("ou se trouve" in normalized_question or "ou est" in normalized_question or "dans quelle salle" in normalized_question)),
                 "demain" in normalized_question,
                 "aujourd" in normalized_question,
                 any(day in normalized_question for day in ["lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche"]),
@@ -2671,6 +2855,17 @@ class SQLAgent:
 
         if self._is_available_rooms_day_question(question):
             sql_query, params = self._available_rooms_day_sql(question, context)
+            return self._exec_and_format(question, sql_query, params, context)
+
+        if self._is_class_location_question(question):
+            cls = self._extract_class_candidate(question) or ""
+            cls = self._normalize_class_aliases(cls, context)
+            if context.get("semestre_id") and not self._class_exists_in_db(cls, context):
+                return (
+                    f"Je ne trouve pas la classe '{cls}' dans le semestre actuel ({context.get('semestre','?')}). "
+                    "Verifiez le nom (ex: '1 TIC 2') ou precisez le semestre (S1/S2)."
+                )
+            sql_query, params = self._class_location_sql(question, context)
             return self._exec_and_format(question, sql_query, params, context)
 
         if self._is_prof_class_question(question):

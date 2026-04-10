@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import re
 import unicodedata
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import requests
 
@@ -18,6 +18,97 @@ DAY_DISPLAY_ORDER = {
     "dimanche": 7,
 }
 FRENCH_DAY_NAMES = tuple(DAY_DISPLAY_ORDER.keys())
+CONVERSATION_MARKERS = (
+    "bonjour",
+    "bonsoir",
+    "salut",
+    "coucou",
+    "hello",
+    "hi",
+    "hey",
+    "salam",
+    "slm",
+    "cc",
+)
+THANKS_MARKERS = (
+    "merci",
+    "thanks",
+    "thank you",
+    "jazak",
+)
+HELP_MARKERS = (
+    "aide",
+    "help",
+    "tu peux faire quoi",
+    "que peux tu faire",
+    "qu est ce que tu peux faire",
+    "qui es tu",
+    "t es qui",
+)
+QUESTION_STARTERS = (
+    "quel",
+    "quelle",
+    "quels",
+    "quelles",
+    "combien",
+    "comment",
+    "pourquoi",
+    "ou",
+    "où",
+    "c est quoi",
+    "qu est ce que",
+    "est ce que",
+)
+ACADEMIC_MARKERS = (
+    "emploi",
+    "edt",
+    "planning",
+    "horaire",
+    "cours",
+    "seance",
+    "matiere",
+    "prof",
+    "professeur",
+    "enseign",
+    "classe",
+    "salle",
+    "semestre",
+    "periode",
+    "vacance",
+    "ferie",
+    "examen",
+    "ds",
+    "rattrap",
+    "revision",
+    "enetcom",
+    "universite",
+    "ecole",
+    "formation",
+    "plan",
+    "etude",
+    "etudes",
+    "programme",
+    "curriculum",
+    "licence",
+    "master",
+    "mastere",
+    "doctorat",
+    "departement",
+    "contact",
+    "adresse",
+    "telephone",
+    "mail",
+    "email",
+    "absence",
+    "absences",
+    "extranet",
+    "actualite",
+    "news",
+    "bibliotheque",
+    "club",
+    "stage",
+    "pfe",
+)
 
 class GroqService:
     def __init__(self):
@@ -71,6 +162,223 @@ class GroqService:
         for source, target in typo_fixes.items():
             normalized = re.sub(rf"\b{re.escape(source)}\b", target, normalized)
         return normalized
+
+    def _history_as_text(self, history: Optional[list], limit: int = 4) -> str:
+        if not history:
+            return ""
+
+        lines: List[str] = []
+        for item in history[-limit:]:
+            role = getattr(item, "role", None)
+            content = getattr(item, "content", None)
+            if isinstance(item, dict):
+                role = item.get("role", role)
+                content = item.get("content", content)
+            role = str(role or "user").strip()
+            content = str(content or "").strip()
+            if content:
+                lines.append(f"{role}: {content}")
+        return "\n".join(lines)
+
+    def _is_obvious_academic_request(self, message: str) -> bool:
+        q = self._normalize_text(message)
+        if not q:
+            return False
+
+        if any(marker in q for marker in ACADEMIC_MARKERS):
+            return True
+        if any(day_name in q for day_name in FRENCH_DAY_NAMES):
+            return True
+        if any(marker in q for marker in ["aujourd", "demain", "hier", "maintenant", "actuellement"]):
+            return True
+        if re.search(r"\b\d\s*(ing|tic|ltic|mp|mr)\b", q):
+            return True
+        if re.search(r"\b(?:mr|mme|m|monsieur|madame|dr)\s+[a-z]", q):
+            return True
+        if re.search(r"\b[a-z]{1,6}\s*0?\d{1,2}\b", q) and "salle" in q:
+            return True
+        return False
+
+    def _is_simple_conversation(self, message: str) -> bool:
+        q = self._normalize_text(message)
+        if not q:
+            return True
+
+        compact = q.replace(" ", "")
+        if compact in {"cv", "cava"}:
+            return True
+        if any(marker == q or q.startswith(f"{marker} ") or f" {marker} " in f" {q} " for marker in CONVERSATION_MARKERS):
+            return True
+        if any(marker in q for marker in THANKS_MARKERS):
+            return True
+        if any(marker in q for marker in HELP_MARKERS):
+            return True
+        return False
+
+    def _classify_message_mode(self, message: str, history: Optional[list] = None) -> Optional[str]:
+        if not self.enabled:
+            return None
+
+        history_text = self._history_as_text(history)
+        prompt = f"""Classify the last user message for an ENET'Com assistant.
+
+Return exactly one label:
+- NON_ACADEMIC: greeting, thanks, casual talk, asking what the assistant can do, or any request outside ENET'Com scope
+- ACADEMIC: anything about timetable, classes, rooms, teachers, exams, holidays, ENET'Com information, news, contact, departments, studies, or student services
+
+If the user message could reasonably be an academic request even with informal wording, return ACADEMIC.
+
+Examples:
+- "bonjour" -> NON_ACADEMIC
+- "salut cv" -> NON_ACADEMIC
+- "merci beaucoup" -> NON_ACADEMIC
+- "tu peux m'aider ?" -> NON_ACADEMIC
+- "j'ai quoi demain" -> ACADEMIC
+- "chnia andi ghedwa" -> ACADEMIC
+- "win nalka salle libre tawa" -> ACADEMIC
+- "ou est mr ben amor" -> ACADEMIC
+- "salle libre maintenant" -> ACADEMIC
+- "quelles sont les actualites" -> ACADEMIC
+- "quel est le prix de l'or" -> NON_ACADEMIC
+
+Recent history:
+{history_text or "None"}
+
+Last user message:
+{message}
+"""
+
+        response = self._post_with_retry(
+            {
+                "model": self.model,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": "You classify requests for an ENET'Com assistant. Return exactly one label: ACADEMIC or NON_ACADEMIC.",
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                "temperature": 0.0,
+                "max_tokens": 10,
+            },
+            timeout=15,
+        )
+        if response is None or response.status_code != 200:
+            if response is not None:
+                print(f"Groq intent classification error: {response.status_code} - {response.text}")
+            return None
+
+        payload = self._safe_json(response)
+        if not payload:
+            return None
+
+        raw = (payload.get("choices", [{}])[0].get("message", {}).get("content", "") or "").strip().upper()
+        if "ACADEMIC" in raw:
+            return "ACADEMIC"
+        if "NON_ACADEMIC" in raw:
+            return "NON_ACADEMIC"
+        return None
+
+    def _fallback_conversational_response(self, message: str, user_class: Optional[str] = None) -> str:
+        q = self._normalize_text(message)
+        class_hint = f" Votre classe actuelle est {user_class}." if user_class else ""
+
+        if not q:
+            return "Je suis la pour vous aider. Posez-moi une question sur votre emploi du temps, une salle, un professeur ou ENET'Com."
+        if any(marker in q for marker in THANKS_MARKERS):
+            return "Avec plaisir. Si vous voulez, je peux aussi vous aider pour l'emploi du temps, les salles, les professeurs ou les infos ENET'Com."
+        if any(marker in q for marker in HELP_MARKERS):
+            return (
+                "Je peux vous aider avec l'emploi du temps, les cours du jour, les salles disponibles, les professeurs, "
+                "le calendrier universitaire et les informations ENET'Com." + class_hint
+            )
+        if "ca va" in q or q.replace(" ", "") in {"cv", "cava"}:
+            return "Ca va bien, merci. Je peux vous aider avec votre emploi du temps, les salles, les professeurs ou les infos ENET'Com."
+        if any(marker == q or q.startswith(f"{marker} ") for marker in CONVERSATION_MARKERS):
+            return "Bonjour. Je peux vous aider pour l'emploi du temps, les salles, les professeurs et les informations ENET'Com."
+        return (
+            "Je suis la pour vous aider. Dites-moi ce que vous cherchez, par exemple votre emploi du temps, une salle libre, "
+            "un professeur ou une information sur ENET'Com."
+        )
+
+    def _fallback_out_of_scope_response(self, message: str) -> str:
+        q = self._normalize_text(message)
+        if any(q.startswith(marker) for marker in QUESTION_STARTERS) or "?" in (message or ""):
+            return (
+                "Je suis surtout l'assistant ENET'Com. Je peux vous aider pour l'emploi du temps, les salles, les professeurs, "
+                "les absences, le calendrier universitaire et les informations de l'ecole."
+            )
+        return "Je suis surtout l'assistant ENET'Com. Posez-moi une question sur l'emploi du temps, les salles, les professeurs ou les services de l'ecole."
+
+    def maybe_answer_conversational_message(
+        self,
+        message: str,
+        history: Optional[list] = None,
+        user_class: Optional[str] = None,
+    ) -> Optional[str]:
+        if self._is_obvious_academic_request(message):
+            return None
+
+        if self._is_simple_conversation(message):
+            return self._fallback_conversational_response(message, user_class)
+
+        mode = self._classify_message_mode(message, history)
+        if mode == "ACADEMIC":
+            return None
+
+        if mode is None:
+            return self._fallback_out_of_scope_response(message)
+
+        if not self.enabled:
+            return self._fallback_out_of_scope_response(message)
+
+        history_text = self._history_as_text(history)
+        prompt = f"""Tu es un assistant intelligent pour ENET'Com.
+
+Le message de l'utilisateur n'entre pas clairement dans le perimetre ENET'Com.
+Reponds naturellement et de facon utile, sans t'appuyer sur l'historique pour inventer une reponse hors sujet.
+
+Consignes:
+- Explique poliment si la demande est hors perimetre.
+- Si la demande est vague, aide-le a formuler une question utile.
+- Tu peux proposer tes capacites: emploi du temps, cours, professeurs, salles, absences, calendrier universitaire, informations ENET'Com.
+- N'evoque pas inutilement les anciens messages, la classe ou un contexte precedent si cela n'aide pas la reponse.
+- Reste bref, chaleureux, sans markdown.
+
+Classe connue: {user_class or "inconnue"}
+Historique recent:
+{history_text or "Aucun"}
+
+Dernier message utilisateur:
+{message}
+"""
+
+        response = self._post_with_retry(
+            {
+                "model": self.model,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": "Tu es un assistant conversationnel ENET'Com. Quand une demande est hors perimetre, dis-le poliment et recentre vers les sujets ENET'Com.",
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                "temperature": 0.3,
+                "max_tokens": 220,
+            },
+            timeout=20,
+        )
+        if response is None or response.status_code != 200:
+            if response is not None:
+                print(f"Groq conversation error: {response.status_code} - {response.text}")
+            return self._fallback_out_of_scope_response(message)
+
+        payload = self._safe_json(response)
+        if not payload:
+            return self._fallback_out_of_scope_response(message)
+
+        raw = (payload.get("choices", [{}])[0].get("message", {}).get("content", "") or "").strip()
+        return self._postprocess_response(raw) if raw else self._fallback_out_of_scope_response(message)
 
     def _normalize_room_name(self, value: Any) -> str:
         text = self._repair_text_encoding(str(value or ""))
@@ -263,6 +571,13 @@ class GroqService:
                         lines.append(f"... et {len(unique_values) - 80} autres salles.")
                     return "\n".join(lines)
                 if "ou se trouve" in q:
+                    class_name = self._extract_class_candidate(question)
+                    if "classe" in q or class_name:
+                        class_label = class_name or "votre classe"
+                        if len(values) == 1:
+                            return f"La classe {class_label} se trouve en salle {self._normalize_room_name(values[0])}."
+                        normalized_values = [self._normalize_room_name(value) for value in values]
+                        return f"La classe {class_label} se trouve dans plusieurs salles : {', '.join(normalized_values)}."
                     if len(values) == 1:
                         return f"Ce professeur se trouve en salle {self._normalize_room_name(values[0])}."
                     normalized_values = [self._normalize_room_name(value) for value in values]
@@ -311,6 +626,8 @@ class GroqService:
                     salle = self._normalize_room_name(row.get(normalized_keys["salle"]))
                     lines.append(f"- {day} {start}-{end} : {classe} en salle {salle}")
                 if lines:
+                    if "classe" in q:
+                        return "Voici ou se trouve la classe :\n" + "\n".join(lines[:12])
                     return "Voici ou se trouve ce professeur :\n" + "\n".join(lines[:12])
             return None
 

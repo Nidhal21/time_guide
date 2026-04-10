@@ -4,6 +4,7 @@ from pydantic import BaseModel
 from typing import List, Optional, Tuple
 import re
 from app.models.db_config import get_db
+from app.services.groq_service import groq_service
 from app.services.sql_agent import SQLAgent
 
 router = APIRouter()
@@ -93,8 +94,7 @@ def _extract_pending_request(history: list) -> Optional[Tuple[str, str, str]]:
 
 
 def _message_has_class_reference(message: str) -> bool:
-    content = (message or "").lower()
-    return bool(CLASS_PATTERN.search(message or "")) or "ma classe" in content
+    return bool(CLASS_PATTERN.search(message or ""))
 
 def _message_has_prof_reference(message: str) -> bool:
     return bool(PROF_PATTERN.search(message or ""))
@@ -128,6 +128,13 @@ def _likely_schedule_question(message: str) -> bool:
     day_markers = ["lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche", "aujourd", "demain", "hier"]
     return "classe" in q and any(day in q for day in day_markers)
 
+def _likely_class_location_question(message: str) -> bool:
+    q = _normalize_for_intent(message)
+    if not q:
+        return False
+    location_markers = ["ou se trouve", "où se trouve", "ou est", "où est", "dans quelle salle", "salle"]
+    return ("classe" in q or "ma classe" in q or "mon classe" in q) and any(marker in q for marker in location_markers)
+
 def _likely_professor_followup(message: str) -> bool:
     q = _normalize_for_intent(message)
     if not q:
@@ -151,7 +158,7 @@ def _looks_like_fresh_request(message: str) -> bool:
         return False
     if normalized in {"oui", "non", "ok", "daccord", "d accord", "yes", "no"}:
         return False
-    return _likely_schedule_question(message) or _likely_professor_followup(message)
+    return _likely_schedule_question(message) or _likely_professor_followup(message) or _likely_class_location_question(message)
 
 def _extract_confirmed_professor(message: str, assistant_message: str) -> Optional[str]:
     user_reply = re.sub(r"\s+", " ", (message or "")).strip()
@@ -215,12 +222,12 @@ async def chat(request: ChatRequest, db: Session = Depends(get_db)):
             full_question = _replace_professor_in_question(agent, original_question, selected_professor or request.message)
     else:
         # Prefer explicit user_class from the request, then recent history.
-        if user_class and not CLASS_PATTERN.search(request.message) and _likely_schedule_question(request.message):
+        if user_class and not CLASS_PATTERN.search(request.message) and (_likely_schedule_question(request.message) or _likely_class_location_question(request.message)):
             full_question = request.message if _message_has_class_reference(request.message) else f"{request.message} pour la classe {user_class}"
         else:
             # Inject last known class into follow-up questions that lack one
-            last_class = _extract_last_class(request.history)
-            if last_class and not CLASS_PATTERN.search(request.message) and _likely_schedule_question(request.message):
+            last_class = _extract_last_class(request.history) or user_class
+            if last_class and not CLASS_PATTERN.search(request.message) and (_likely_schedule_question(request.message) or _likely_class_location_question(request.message)):
                 full_question = request.message if _message_has_class_reference(request.message) else f"{request.message} pour la classe {last_class}"
             else:
                 last_professor = _extract_last_professor(request.history)
@@ -230,6 +237,14 @@ async def chat(request: ChatRequest, db: Session = Depends(get_db)):
                     context_messages = request.history[-3:] if request.history else []
                     context_text = "\n".join([f"{msg.role}: {msg.content}" for msg in context_messages])
                     full_question = f"{context_text}\nuser: {request.message}" if context_text else request.message
+
+    conversational_response = groq_service.maybe_answer_conversational_message(
+        request.message,
+        request.history,
+        user_class=user_class,
+    )
+    if conversational_response:
+        return ChatResponse(response=conversational_response)
 
     response = agent.process_question(full_question)
     return ChatResponse(response=response)
