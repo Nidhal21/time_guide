@@ -817,10 +817,17 @@ class SQLAgent:
             "emploi de temps",
             "emplois du temps",
             "emplois de temps",
+            "j ai quoi",
+            "jai quoi",
+            "andi",
+            "ghedwa",
+            "tawa",
         ]
         if any(m in q for m in markers):
             return True
         if "emp" in q and ("temps" in q or "planning" in q or "horaire" in q):
+            return True
+        if self._extract_class_candidate(question) and any(day in q for day in ["lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche", "aujourd", "demain", "hier"]):
             return True
         return False
 
@@ -1002,8 +1009,10 @@ class SQLAgent:
         return bool(row)
 
     def _is_class_schedule_question(self, question: str) -> bool:
+        q = self._normalize_text(question)
         if not self._is_schedule_intent(question):
-            return False
+            if not (self._extract_class_candidate(question) and any(day in q for day in ["lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche", "aujourd", "demain", "hier"])):
+                return False
         if not self._extract_class_candidate(question):
             return False
         if self._extract_room_candidate(question):
@@ -1869,6 +1878,10 @@ class SQLAgent:
             "mon edt",
             "mon planning",
             "cette annee",
+            "donner lavis dabsence",
+            "lavis dabsence",
+            "avis dabsence",
+            "avis d absence",
         }
         invalid_tokens = {
             "lundi",
@@ -1917,6 +1930,15 @@ class SQLAgent:
             "planning",
             "horaire",
             "edt",
+            "absence",
+            "absences",
+            "avis",
+            "lavis",
+            "dabsence",
+            "donner",
+            "extranet",
+            "login",
+            "connexion",
         }
         return not (
             normalized_candidate in invalid_candidates
@@ -2770,6 +2792,11 @@ class SQLAgent:
                 "cours" in normalized_question,
                 "seance" in normalized_question,
                 "j'ai cours" in normalized_question,
+                "j ai quoi" in normalized_question,
+                "jai quoi" in normalized_question,
+                "andi" in normalized_question,
+                "ghedwa" in normalized_question,
+                "tawa" in normalized_question,
                 ("classe" in normalized_question and ("ou se trouve" in normalized_question or "ou est" in normalized_question or "dans quelle salle" in normalized_question)),
                 "demain" in normalized_question,
                 "aujourd" in normalized_question,

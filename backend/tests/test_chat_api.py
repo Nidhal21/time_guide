@@ -195,6 +195,39 @@ class ChatApiWeekdaySmokeTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["response"], "emploi de temps de 1IDSD2")
 
+    def test_compact_user_class_is_injected_into_schedule_followup(self):
+        with patch("app.routes.chat.SQLAgent.process_question", side_effect=lambda self, question: question):
+            response = self.client.post(
+                "/api/chat",
+                json={
+                    "message": "j'ai quoi demain",
+                    "user_role": "student",
+                    "user_class": "2gii3",
+                    "history": [],
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["response"], "j'ai quoi demain pour la classe 2 ING GII 3")
+
+    def test_last_compact_class_is_reused_from_history(self):
+        history = [
+            {"role": "user", "content": "emploi de temps de 2gii3"},
+            {"role": "assistant", "content": "Voici votre emploi du temps."},
+        ]
+        with patch("app.routes.chat.SQLAgent.process_question", side_effect=lambda self, question: question):
+            response = self.client.post(
+                "/api/chat",
+                json={
+                    "message": "j'ai quoi demain",
+                    "user_role": "student",
+                    "history": history,
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["response"], "j'ai quoi demain pour la classe 2 ING GII 3")
+
 
 if __name__ == "__main__":
     unittest.main()

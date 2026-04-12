@@ -1,17 +1,21 @@
 from fastapi import APIRouter, Depends
-from sqlalchemy.orm import Session
 from pydantic import BaseModel
+from sqlalchemy.orm import Session
 from typing import List, Optional, Tuple
 import re
+import unicodedata
+
 from app.models.db_config import get_db
 from app.services.groq_service import groq_service
 from app.services.sql_agent import SQLAgent
 
 router = APIRouter()
 
+
 class Message(BaseModel):
     role: str
     content: str
+
 
 class ChatRequest(BaseModel):
     message: str
@@ -19,8 +23,10 @@ class ChatRequest(BaseModel):
     user_class: str = None
     history: Optional[List[Message]] = []
 
+
 class ChatResponse(BaseModel):
     response: str
+
 
 CLASS_PATTERN = re.compile(
     r"\b(?:\d\s*(?:(?:ING|TIC|LTIC|MP|MR)\s*[A-Z0-9\-]*\s*\d?|(?:GII|GEC|GT|IDSD|INFO|TELECOM)\s*\d)|\d(?:GII|GEC|GT|IDSD|INFO|TELECOM)\d)\b",
@@ -30,38 +36,64 @@ PROF_PATTERN = re.compile(
     r"\b(?:mr|mme|m\.|monsieur|madame)\s+([A-Za-zÀ-ÿ'\-]+(?:\s+[A-Za-zÀ-ÿ'\-]+){1,2})\b",
     re.IGNORECASE,
 )
+CLASS_SHORTHAND_CODES = {"GII", "GEC", "GT", "IDSD", "INFO", "TELECOM"}
+
+
+def _normalize_text(value: str) -> str:
+    normalized = unicodedata.normalize("NFKD", value or "")
+    normalized = "".join(ch for ch in normalized if not unicodedata.combining(ch))
+    normalized = normalized.lower().replace("'", " ")
+    normalized = re.sub(r"[^\w\s/-]", " ", normalized)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    return normalized
+
+
+def _extract_class_candidate(message: str) -> Optional[str]:
+    q = (message or "").strip()
+    if not q:
+        return None
+
+    match = re.search(
+        r"\b(\d)\s*(ING|TIC|LTIC|MP|MR)\b(?:\s+([A-Z0-9\-]+))?(?:\s+([A-Z0-9\-]+))?(?:\s+(\d))?\b",
+        q,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        parts = [part for part in match.groups() if part]
+        return re.sub(r"\s+", " ", " ".join([parts[0]] + [part.upper() for part in parts[1:]])).strip()
+
+    match = re.search(r"\b(\d)\s*([A-Za-z\-]{2,10})\s*(\d)\b", q, flags=re.IGNORECASE)
+    if match:
+        year, middle, group = match.group(1), match.group(2).upper(), match.group(3)
+        if middle in CLASS_SHORTHAND_CODES:
+            return f"{year} ING {middle} {group}"
+        return f"{year} {middle} {group}"
+
+    match = re.search(r"\b(\d)(GII|GEC|GT|IDSD|INFO|TELECOM)(\d)\b", q, flags=re.IGNORECASE)
+    if match:
+        year, specialty, group = match.group(1), match.group(2).upper(), match.group(3)
+        return f"{year} ING {specialty} {group}"
+
+    return None
+
 
 def _extract_last_class(history: list) -> Optional[str]:
-    """Scan history in reverse to find the last class mentioned by the user."""
     for msg in reversed(history or []):
         if msg.role == "user":
-            m = CLASS_PATTERN.search(msg.content)
-            if m:
-                return re.sub(r"\s+", " ", m.group(0)).strip()
+            class_candidate = _extract_class_candidate(msg.content)
+            if class_candidate:
+                return class_candidate
     return None
+
 
 def _extract_last_professor(history: list) -> Optional[str]:
     for msg in reversed(history or []):
         if msg.role == "user":
-            m = PROF_PATTERN.search(msg.content or "")
-            if m:
-                return re.sub(r"\s+", " ", m.group(1)).strip()
+            match = PROF_PATTERN.search(msg.content or "")
+            if match:
+                return re.sub(r"\s+", " ", match.group(1)).strip()
     return None
 
-def _extract_pending_intent(history: list) -> Optional[str]:
-    """If the last assistant message was asking for a class/prof, return the original user question."""
-    if not history or len(history) < 2:
-        return None
-    last_assistant = next((m.content for m in reversed(history) if m.role == "assistant"), None)
-    if not last_assistant:
-        return None
-    ask_triggers = ["quelle est votre classe", "quel professeur", "pour quelle classe"]
-    if any(t in last_assistant.lower() for t in ask_triggers):
-        for i in range(len(history) - 1, -1, -1):
-            if history[i].role == "assistant" and any(t in history[i].content.lower() for t in ask_triggers):
-                if i > 0 and history[i - 1].role == "user":
-                    return history[i - 1].content
-    return None
 
 def _extract_pending_request(history: list) -> Optional[Tuple[str, str, str]]:
     if not history or len(history) < 2:
@@ -94,16 +126,16 @@ def _extract_pending_request(history: list) -> Optional[Tuple[str, str, str]]:
 
 
 def _message_has_class_reference(message: str) -> bool:
-    return bool(CLASS_PATTERN.search(message or ""))
+    return bool(_extract_class_candidate(message))
+
 
 def _message_has_prof_reference(message: str) -> bool:
     return bool(PROF_PATTERN.search(message or ""))
 
+
 def _normalize_for_intent(message: str) -> str:
-    content = (message or "").lower()
-    content = re.sub(r"[^\w\s']", " ", content)
-    content = re.sub(r"\s+", " ", content).strip()
-    return content
+    return _normalize_text(message)
+
 
 def _likely_schedule_question(message: str) -> bool:
     q = _normalize_for_intent(message)
@@ -121,19 +153,28 @@ def _likely_schedule_question(message: str) -> bool:
         "matiere",
         "tp",
         "td",
+        "j ai quoi",
+        "jai quoi",
+        "andi",
+        "ghedwa",
+        "tawa",
     ]
     if any(marker in q for marker in schedule_markers):
         return True
 
     day_markers = ["lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche", "aujourd", "demain", "hier"]
+    if _message_has_class_reference(message) and any(day in q for day in day_markers):
+        return True
     return "classe" in q and any(day in q for day in day_markers)
+
 
 def _likely_class_location_question(message: str) -> bool:
     q = _normalize_for_intent(message)
     if not q:
         return False
-    location_markers = ["ou se trouve", "où se trouve", "ou est", "où est", "dans quelle salle", "salle"]
+    location_markers = ["ou se trouve", "ou est", "dans quelle salle", "salle"]
     return ("classe" in q or "ma classe" in q or "mon classe" in q) and any(marker in q for marker in location_markers)
+
 
 def _likely_professor_followup(message: str) -> bool:
     q = _normalize_for_intent(message)
@@ -152,6 +193,7 @@ def _likely_professor_followup(message: str) -> bool:
     ]
     return any(marker in q for marker in markers)
 
+
 def _looks_like_fresh_request(message: str) -> bool:
     normalized = _normalize_for_intent(message)
     if not normalized:
@@ -159,6 +201,7 @@ def _looks_like_fresh_request(message: str) -> bool:
     if normalized in {"oui", "non", "ok", "daccord", "d accord", "yes", "no"}:
         return False
     return _likely_schedule_question(message) or _likely_professor_followup(message) or _likely_class_location_question(message)
+
 
 def _extract_confirmed_professor(message: str, assistant_message: str) -> Optional[str]:
     user_reply = re.sub(r"\s+", " ", (message or "")).strip()
@@ -180,6 +223,7 @@ def _extract_confirmed_professor(message: str, assistant_message: str) -> Option
 
     return user_reply
 
+
 def _replace_professor_in_question(agent: SQLAgent, original_question: str, professor_name: str) -> str:
     original_question = re.sub(r"\s+", " ", (original_question or "")).strip()
     professor_name = re.sub(r"\s+", " ", (professor_name or "")).strip()
@@ -191,22 +235,30 @@ def _replace_professor_in_question(agent: SQLAgent, original_question: str, prof
         return re.sub(re.escape(existing_prof), professor_name, original_question, count=1, flags=re.IGNORECASE)
 
     normalized = _normalize_for_intent(original_question)
+    day_suffix = ""
+    if "demain" in normalized:
+        day_suffix = " demain"
+    elif "aujourd" in normalized:
+        day_suffix = " aujourd'hui"
+    elif "hier" in normalized:
+        day_suffix = " hier"
     if _likely_schedule_question(original_question):
-        return f"emploi du temps de {professor_name}"
+        return f"emploi du temps de {professor_name}{day_suffix}"
     if "ou se trouve" in normalized or "dans quelle salle" in normalized or "ou est" in normalized:
-        return f"ou se trouve {professor_name}"
+        return f"ou se trouve {professor_name}{day_suffix}"
     if "quelle classe" in normalized or "dans quelle classe" in normalized:
-        return f"dans quelle classe se trouve {professor_name}"
+        return f"dans quelle classe se trouve {professor_name}{day_suffix}"
     if "quel cours" in normalized or "quelle matiere" in normalized:
-        return f"quel cours fait {professor_name}"
+        return f"quel cours fait {professor_name}{day_suffix}"
     if "a cours" in normalized:
-        return f"{professor_name} a cours aujourd'hui"
+        return f"{professor_name} a cours{day_suffix or ' aujourd hui'}"
     return f"{original_question} pour le professeur {professor_name}"
+
 
 @router.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest, db: Session = Depends(get_db)):
     agent = SQLAgent(db)
-    user_class = re.sub(r"\s+", " ", (request.user_class or "")).strip() or None
+    user_class = _extract_class_candidate(request.user_class or "") or re.sub(r"\s+", " ", (request.user_class or "")).strip() or None
 
     pending_request = _extract_pending_request(request.history)
     if pending_request and _looks_like_fresh_request(request.message):
@@ -215,19 +267,17 @@ async def chat(request: ChatRequest, db: Session = Depends(get_db)):
     if pending_request:
         request_kind, original_question, assistant_message = pending_request
         if request_kind == "class":
-            class_value = user_class or request.message
+            class_value = user_class or _extract_class_candidate(request.message) or request.message
             full_question = f"{original_question} pour la classe {class_value}"
         else:
             selected_professor = _extract_confirmed_professor(request.message, assistant_message)
             full_question = _replace_professor_in_question(agent, original_question, selected_professor or request.message)
     else:
-        # Prefer explicit user_class from the request, then recent history.
-        if user_class and not CLASS_PATTERN.search(request.message) and (_likely_schedule_question(request.message) or _likely_class_location_question(request.message)):
+        if user_class and not _message_has_class_reference(request.message) and (_likely_schedule_question(request.message) or _likely_class_location_question(request.message)):
             full_question = request.message if _message_has_class_reference(request.message) else f"{request.message} pour la classe {user_class}"
         else:
-            # Inject last known class into follow-up questions that lack one
             last_class = _extract_last_class(request.history) or user_class
-            if last_class and not CLASS_PATTERN.search(request.message) and (_likely_schedule_question(request.message) or _likely_class_location_question(request.message)):
+            if last_class and not _message_has_class_reference(request.message) and (_likely_schedule_question(request.message) or _likely_class_location_question(request.message)):
                 full_question = request.message if _message_has_class_reference(request.message) else f"{request.message} pour la classe {last_class}"
             else:
                 last_professor = _extract_last_professor(request.history)

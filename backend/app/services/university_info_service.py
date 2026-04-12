@@ -147,8 +147,12 @@ class UniversityInfoService:
         markers = [
             "absence",
             "absences",
+            "dabsence",
             "avis d absence",
             "avis de absence",
+            "avis absence",
+            "lavis",
+            "avis",
             "justificatif d absence",
             "justificatif absence",
             "extranet",
@@ -198,11 +202,24 @@ class UniversityInfoService:
                 f"Vous pouvez essayer ici : {self.ABSENCES_URL}"
             )
 
-        if "/login" in final_url.lower() or "se connecter" in page_text.lower():
+        normalized_text = self._normalize_text(page_text)
+        login_markers = [
+            "/login" in final_url.lower(),
+            "se connecter" in normalized_text,
+            "connexion" in normalized_text,
+            "login" in normalized_text,
+            "espace extranet" in normalized_text and "connect" in normalized_text,
+        ]
+        if any(login_markers):
             return (
-                "Les avis d'absence sont disponibles sur l'espace extranet et necessitent une connexion etudiante. "
-                f"Si l'etudiant est connecte, il peut consulter la page suivante : {self.ABSENCES_URL} "
-                "Sinon, il sera redirige vers la page de connexion."
+                "Pour consulter les absences des enseignants, l'etudiant doit d'abord se connecter a l'Espace Extranet. "
+                f"Ensuite, il peut ouvrir cette page : {self.ABSENCES_URL}"
+            )
+
+        if "pas d absence des enseignants" in normalized_text:
+            return (
+                "Il n'y a pas d'absence des enseignants pour le moment.\n\n"
+                f"Source : {self.ABSENCES_URL}"
             )
 
         snippet = re.sub(r"\s+", " ", page_text).strip()[:700]
