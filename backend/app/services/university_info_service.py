@@ -4,7 +4,7 @@ import html
 import re
 import time
 import unicodedata
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 from urllib.parse import urljoin
 
 import requests
@@ -148,20 +148,39 @@ class UniversityInfoService:
             "absence",
             "absences",
             "dabsence",
+            "avis dabsence",
             "avis d absence",
             "avis de absence",
             "avis absence",
+            "lavis dabsence",
+            "lavis d absence",
             "lavis",
-            "avis",
-            "justificatif d absence",
-            "justificatif absence",
+            "prof absent",
+            "profs absents",
+            "professeurs absents",
+            "enseignants absents",
+            "les profs absents",
+            "prof est absent",
+            "prof est absant",
+            "professeur est absent",
+            "professeur est absant",
+            "est ce que le prof",
             "extranet",
         ]
         return any(marker in normalized_question for marker in markers)
 
     def _study_plan_keys_for_question(self, question: str) -> List[str]:
         normalized_question = self._normalize_text(question)
-        if not any(marker in normalized_question for marker in ["plan", "etude", "etudes", "programme", "curriculum"]):
+        if not any(
+            marker in normalized_question
+            for marker in [
+                "plan",
+                "etude",
+                "etudes",
+                "programme",
+                "curriculum",
+            ]
+        ):
             return []
 
         keys: List[str] = []
@@ -174,7 +193,7 @@ class UniversityInfoService:
         if re.search(r"\bgt\b", normalized_question) or "genie telecommunication" in normalized_question:
             keys.append("gt")
         if not keys:
-            keys = ["gii", "gec", "idsd", "gt"]
+            keys = ["gii", "gec", "gt", "idsd"]
         return list(dict.fromkeys(keys))
 
     def _study_plan_response(self, keys: List[str]) -> str:
@@ -190,11 +209,112 @@ class UniversityInfoService:
         lines.extend(["", f"Source : {self.BASE_URL}"])
         return "\n".join(lines)
 
+    def _clean_display_text(self, value: str) -> str:
+        text = html.unescape(value or "")
+        text = re.sub(r"<[^>]+>", " ", text)
+        text = re.sub(r"\s+", " ", text).strip(" -:|")
+        return text
+
+    def _looks_like_absent_teacher(self, value: str) -> bool:
+        text = self._clean_display_text(value)
+        if not text:
+            return False
+        if len(text) > 120:
+            return False
+
+        normalized = self._normalize_text(text)
+        stop_markers = [
+            "absence",
+            "enseignant",
+            "professeur",
+            "matiere",
+            "seance",
+            "date",
+            "heure",
+            "motif",
+            "classe",
+            "groupe",
+            "observation",
+            "pas d absence",
+            "espace extranet",
+            "se connecter",
+        ]
+        if any(marker in normalized for marker in stop_markers):
+            return False
+
+        return bool(re.search(r"[A-Za-z]{2,}", text)) and len(text.split()) <= 6
+
+    def _extract_absence_teachers(self, html_content: str) -> List[str]:
+        teachers: List[str] = []
+        seen = set()
+
+        row_matches = re.findall(r"<tr\b[^>]*>(.*?)</tr>", html_content or "", flags=re.IGNORECASE | re.DOTALL)
+        for row_html in row_matches:
+            cell_matches = re.findall(r"<t[dh]\b[^>]*>(.*?)</t[dh]>", row_html, flags=re.IGNORECASE | re.DOTALL)
+            row_values = [self._clean_display_text(cell) for cell in cell_matches]
+            row_values = [value for value in row_values if value]
+            if not row_values:
+                continue
+
+            for value in row_values:
+                if not self._looks_like_absent_teacher(value):
+                    continue
+                normalized = self._normalize_text(value)
+                if normalized in seen:
+                    continue
+                seen.add(normalized)
+                teachers.append(value)
+                break
+
+        if teachers:
+            return teachers
+
+        list_matches = re.findall(r"<li\b[^>]*>(.*?)</li>", html_content or "", flags=re.IGNORECASE | re.DOTALL)
+        for item_html in list_matches:
+            value = self._clean_display_text(item_html)
+            if not self._looks_like_absent_teacher(value):
+                continue
+            normalized = self._normalize_text(value)
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            teachers.append(value)
+
+        return teachers
+
+    def _extract_absence_snippet(self, page_text: str, max_chars: int = 700) -> Optional[str]:
+        cleaned = re.sub(r"\s+", " ", page_text or "").strip()
+        if not cleaned:
+            return None
+
+        normalized = self._normalize_text(cleaned)
+        anchor_terms = [
+            "absence",
+            "absences",
+            "enseignants",
+            "prof",
+            "extranet",
+        ]
+        anchor_position = None
+        for term in anchor_terms:
+            match = re.search(re.escape(term), normalized)
+            if match:
+                anchor_position = match.start()
+                break
+
+        if anchor_position is None:
+            return cleaned[:max_chars]
+
+        start = max(0, anchor_position - 120)
+        end = min(len(cleaned), start + max_chars)
+        return cleaned[start:end].strip()
+
     def _absence_response(self) -> str:
         try:
             response = self._session.get(self.ABSENCES_URL, timeout=20, allow_redirects=True)
             final_url = str(response.url)
-            page_text = self._html_to_text(response.text or "")
+            page_html = response.text or ""
+            page_text = self._html_to_text(page_html)
         except Exception as e:
             print(f"University absences fetch error for {self.ABSENCES_URL}: {e}")
             return (
@@ -222,10 +342,18 @@ class UniversityInfoService:
                 f"Source : {self.ABSENCES_URL}"
             )
 
-        snippet = re.sub(r"\s+", " ", page_text).strip()[:700]
+        teachers = self._extract_absence_teachers(page_html)
+        if teachers:
+            lines = ["Voici les enseignants absents trouves sur l'Espace Extranet :", ""]
+            for teacher in teachers[:12]:
+                lines.append(f"- {teacher}")
+            lines.extend(["", f"Source : {self.ABSENCES_URL}"])
+            return "\n".join(lines)
+
+        snippet = self._extract_absence_snippet(page_text)
         if snippet:
             return (
-                "Voici ce que j'ai pu recuperer depuis la page des absences :\n"
+                "Je n'ai pas pu extraire proprement la liste detaillee des absences, mais voici un extrait de la page :\n"
                 f"{snippet}\n\nSource : {self.ABSENCES_URL}"
             )
 

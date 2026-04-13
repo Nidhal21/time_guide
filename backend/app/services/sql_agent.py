@@ -164,6 +164,7 @@ class SQLAgent:
             "feries": "ferie",
             "lemploi": "emploi",
             "l emploi": "emploi",
+            "ou ce trouve": "ou se trouve",
         }
         for source, target in typo_fixes.items():
             normalized = re.sub(rf"\b{re.escape(source)}\b", target, normalized)
@@ -1950,17 +1951,26 @@ class SQLAgent:
         if self._is_schedule_intent(q) and self._extract_class_candidate(q):
             return None
 
+        def _strip_trailing_time_words(value: str) -> str:
+            return re.sub(
+                r"\b(lundi|mardi|mercredi|jeudi|vendredi|samedi|dimanche|aujourd'hui|aujourdhui|demain|hier|maintenant|actuellement|mtn|en ce moment)\b.*$",
+                "",
+                value or "",
+                flags=re.IGNORECASE,
+            ).strip()
+
         match = re.search(
             r"\b(mr|mme|m\.|monsieur|madame)\s+([A-Za-zÀ-ÿ'\-]+\s+[A-Za-zÀ-ÿ'\-]+(?:\s+[A-Za-zÀ-ÿ'\-]+)?)\b",
             q,
             re.IGNORECASE,
         )
         if match:
-            return match.group(2).strip()
+            candidate = _strip_trailing_time_words(match.group(2).strip())
+            return candidate if self._is_valid_prof_candidate_text(candidate) else None
 
         match = re.search(r"\bde\s+([A-Za-zÀ-ÿ'\-]+\s+[A-Za-zÀ-ÿ'\-]+)\b", q, re.IGNORECASE)
         if match:
-            candidate = match.group(1).strip()
+            candidate = _strip_trailing_time_words(match.group(1).strip())
         else:
             fallback_match = re.search(
                 r"(?:dans quelle classe se trouve|ou se trouve|pour quelle classe|quelle classe pour)\s+([A-Za-zÀ-ÿ'\-]+(?:\s+[A-Za-zÀ-ÿ'\-]+){0,2})$",
@@ -1968,12 +1978,12 @@ class SQLAgent:
                 re.IGNORECASE,
             )
             if fallback_match:
-                candidate = fallback_match.group(1).strip()
+                candidate = _strip_trailing_time_words(fallback_match.group(1).strip())
             else:
                 bare_match = re.fullmatch(r"\s*([A-Za-zÀ-ÿ'\-]+(?:\s+[A-Za-zÀ-ÿ'\-]+){1,2})\s*", q)
                 if not bare_match or self._extract_class_candidate(q):
                     return None
-                candidate = bare_match.group(1).strip()
+                candidate = _strip_trailing_time_words(bare_match.group(1).strip())
 
         if not self._is_valid_prof_candidate_text(candidate):
             return None
@@ -2188,7 +2198,15 @@ class SQLAgent:
             re.IGNORECASE,
         )
         if not match:
-            return None
+            single_word_match = re.search(
+                r"\bemploi(?:s)?\s+(?:du|de)\s+temps\s+de\s+([A-Za-z'\-]+)\s*$",
+                question or "",
+                re.IGNORECASE,
+            )
+            if not single_word_match:
+                return None
+            candidate = single_word_match.group(1).strip()
+            return candidate if self._is_valid_prof_candidate_text(candidate) else None
 
         candidate = match.group(1).strip()
         return candidate if self._is_valid_prof_candidate_text(candidate) else None

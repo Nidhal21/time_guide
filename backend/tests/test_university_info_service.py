@@ -32,6 +32,23 @@ class UniversityInfoServiceTests(unittest.TestCase):
         self.assertIn(self.service.STUDY_PLAN_URLS["gec"], response)
         self.assertIn(self.service.STUDY_PLAN_URLS["gt"], response)
 
+    def test_specific_study_plan_question_returns_only_requested_major(self):
+        response = self.service.answer_question("donne moi le plan de etude gii")
+
+        self.assertIn(self.service.STUDY_PLAN_URLS["gii"], response)
+        self.assertNotIn(self.service.STUDY_PLAN_URLS["gec"], response)
+        self.assertNotIn(self.service.STUDY_PLAN_URLS["gt"], response)
+        self.assertNotIn(self.service.STUDY_PLAN_URLS["idsd"], response)
+
+    def test_generic_study_plan_question_returns_all_default_links_in_expected_order(self):
+        response = self.service.answer_question("donne moi le plan d'etude")
+
+        gii_pos = response.index(self.service.STUDY_PLAN_URLS["gii"])
+        gec_pos = response.index(self.service.STUDY_PLAN_URLS["gec"])
+        gt_pos = response.index(self.service.STUDY_PLAN_URLS["gt"])
+        idsd_pos = response.index(self.service.STUDY_PLAN_URLS["idsd"])
+        self.assertTrue(gii_pos < gec_pos < gt_pos < idsd_pos)
+
     def test_absence_question_requires_extranet_login_when_login_page_is_returned(self):
         fake_response = SimpleNamespace(
             url="https://enetcom.rnu.tn/fr/login",
@@ -54,6 +71,40 @@ class UniversityInfoServiceTests(unittest.TestCase):
             response = self.service.answer_question("donne moi les absences enseignants")
 
         self.assertIn("Il n'y a pas d'absence des enseignants", response)
+        self.assertIn(self.service.ABSENCES_URL, response)
+
+    def test_absence_question_extracts_absent_teachers_from_table(self):
+        fake_response = SimpleNamespace(
+            url=self.service.ABSENCES_URL,
+            text="""
+                <html><body>
+                <table>
+                    <tr><th>Enseignant</th><th>Date</th></tr>
+                    <tr><td>BEN SLIMA Mounir</td><td>2026-04-13</td></tr>
+                    <tr><td>TRABELSI Nesrine</td><td>2026-04-13</td></tr>
+                </table>
+                </body></html>
+            """,
+        )
+
+        with patch.object(self.service._session, "get", return_value=fake_response):
+            response = self.service.answer_question("les profs absents aujourd'hui")
+
+        self.assertIn("BEN SLIMA Mounir", response)
+        self.assertIn("TRABELSI Nesrine", response)
+        self.assertIn(self.service.ABSENCES_URL, response)
+
+    def test_absence_question_falls_back_to_page_excerpt_when_detailed_extraction_fails(self):
+        fake_response = SimpleNamespace(
+            url=self.service.ABSENCES_URL,
+            text="<html><body><div>Absences des enseignants : mise a jour en cours pour l'Espace Extranet.</div></body></html>",
+        )
+
+        with patch.object(self.service._session, "get", return_value=fake_response):
+            response = self.service.answer_question("est ce que le prof x est absant")
+
+        self.assertIn("extrait de la page", response)
+        self.assertIn("Absences des enseignants", response)
         self.assertIn(self.service.ABSENCES_URL, response)
 
 

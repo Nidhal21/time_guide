@@ -130,6 +130,14 @@ class SQLAgentWeekdayTests(unittest.TestCase):
         self.assertEqual(self.agent._extract_prof_candidate(question), "ben slima")
         self.assertTrue(self.agent._is_prof_class_question(question))
 
+    def test_extract_prof_candidate_ignores_trailing_time_words(self):
+        question = "ou ce trouve mr ali khalfalah maintenant"
+        self.assertEqual(self.agent._extract_prof_candidate(question), "ali khalfalah")
+
+    def test_prof_location_question_supports_ou_ce_trouve_typo(self):
+        question = "ou ce trouve mr ali khalfalah maintenant"
+        self.assertTrue(self.agent._is_prof_location_question(question))
+
     def test_detects_professor_schedule_question(self):
         self.assertTrue(self.agent._is_prof_schedule_question("emploi de temps de mr yaich mohamed"))
         self.assertFalse(self.agent._is_prof_schedule_question("emploi de temps de 2 ing gii 3"))
@@ -152,6 +160,9 @@ class SQLAgentWeekdayTests(unittest.TestCase):
         self.agent._teacher_prof_exists_in_db = lambda name: name == "SMAOUI Ikram"
         self.agent._prof_exists_in_db = lambda name: name == "SMAOUI Ikram"
         self.assertTrue(self.agent._is_prof_schedule_question("emploi de temps de SMAOUI Ikram"))
+
+    def test_detects_professor_schedule_question_with_single_name(self):
+        self.assertTrue(self.agent._is_prof_schedule_question("emploi de temps de soulef"))
 
     def test_prof_not_found_message_lists_similar_names(self):
         self.agent._find_similar_professors = lambda name: ["ALI KHLFALLAH", "ALI KHALFEDIN"]

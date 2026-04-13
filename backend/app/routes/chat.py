@@ -8,6 +8,7 @@ import unicodedata
 from app.models.db_config import get_db
 from app.services.groq_service import groq_service
 from app.services.sql_agent import SQLAgent
+from app.services.university_info_service import university_info_service
 
 router = APIRouter()
 
@@ -45,6 +46,11 @@ def _normalize_text(value: str) -> str:
     normalized = normalized.lower().replace("'", " ")
     normalized = re.sub(r"[^\w\s/-]", " ", normalized)
     normalized = re.sub(r"\s+", " ", normalized).strip()
+    typo_fixes = {
+        "ou ce trouve": "ou se trouve",
+    }
+    for source, target in typo_fixes.items():
+        normalized = re.sub(rf"\b{re.escape(source)}\b", target, normalized)
     return normalized
 
 
@@ -135,6 +141,60 @@ def _message_has_prof_reference(message: str) -> bool:
 
 def _normalize_for_intent(message: str) -> str:
     return _normalize_text(message)
+
+
+def _is_direct_university_question(message: str) -> bool:
+    q = _normalize_for_intent(message)
+    if not q:
+        return False
+
+    study_plan_markers = [
+        "plan d etude",
+        "plan de etude",
+        "plan detude",
+        "plans d etude",
+        "plans de etude",
+        "plans detudes",
+        "plan des etudes",
+        "plans des etudes",
+        "programme d etude",
+        "programme des etudes",
+        "curriculum",
+    ]
+    if any(marker in q for marker in study_plan_markers):
+        return True
+
+    absence_markers = [
+        "avis d absence",
+        "avis dabsence",
+        "lavis d absence",
+        "lavis dabsence",
+        "absence",
+        "absences",
+        "prof absent",
+        "profs absents",
+        "enseignants absents",
+        "est ce que le prof",
+        "professeur absent",
+        "extranet",
+    ]
+    if any(marker in q for marker in absence_markers):
+        return True
+
+    general_markers = [
+        "actualite",
+        "actualites",
+        "enetcom",
+        "ecole",
+        "universite",
+        "departement",
+        "formation",
+        "master",
+        "licence",
+        "doctorat",
+        "contact",
+    ]
+    return any(marker in q for marker in general_markers)
 
 
 def _likely_schedule_question(message: str) -> bool:
@@ -230,10 +290,6 @@ def _replace_professor_in_question(agent: SQLAgent, original_question: str, prof
     if not original_question or not professor_name:
         return original_question or professor_name
 
-    existing_prof = agent._extract_schedule_prof_candidate(original_question) or agent._extract_prof_candidate(original_question)
-    if existing_prof:
-        return re.sub(re.escape(existing_prof), professor_name, original_question, count=1, flags=re.IGNORECASE)
-
     normalized = _normalize_for_intent(original_question)
     day_suffix = ""
     if "demain" in normalized:
@@ -252,6 +308,11 @@ def _replace_professor_in_question(agent: SQLAgent, original_question: str, prof
         return f"quel cours fait {professor_name}{day_suffix}"
     if "a cours" in normalized:
         return f"{professor_name} a cours{day_suffix or ' aujourd hui'}"
+
+    existing_prof = agent._extract_schedule_prof_candidate(original_question) or agent._extract_prof_candidate(original_question)
+    if existing_prof:
+        return re.sub(re.escape(existing_prof), professor_name, original_question, count=1, flags=re.IGNORECASE)
+
     return f"{original_question} pour le professeur {professor_name}"
 
 
@@ -259,6 +320,10 @@ def _replace_professor_in_question(agent: SQLAgent, original_question: str, prof
 async def chat(request: ChatRequest, db: Session = Depends(get_db)):
     agent = SQLAgent(db)
     user_class = _extract_class_candidate(request.user_class or "") or re.sub(r"\s+", " ", (request.user_class or "")).strip() or None
+
+    if _is_direct_university_question(request.message):
+        response = university_info_service.answer_question(request.message)
+        return ChatResponse(response=response)
 
     pending_request = _extract_pending_request(request.history)
     if pending_request and _looks_like_fresh_request(request.message):
@@ -284,17 +349,23 @@ async def chat(request: ChatRequest, db: Session = Depends(get_db)):
                 if last_professor and not _message_has_prof_reference(request.message) and _likely_professor_followup(request.message):
                     full_question = f"{request.message} pour le professeur {last_professor}"
                 else:
-                    context_messages = request.history[-3:] if request.history else []
-                    context_text = "\n".join([f"{msg.role}: {msg.content}" for msg in context_messages])
-                    full_question = f"{context_text}\nuser: {request.message}" if context_text else request.message
+                    if _looks_like_fresh_request(request.message) and (
+                        _message_has_class_reference(request.message) or _message_has_prof_reference(request.message)
+                    ):
+                        full_question = request.message
+                    else:
+                        context_messages = request.history[-3:] if request.history else []
+                        context_text = "\n".join([f"{msg.role}: {msg.content}" for msg in context_messages])
+                        full_question = f"{context_text}\nuser: {request.message}" if context_text else request.message
 
-    conversational_response = groq_service.maybe_answer_conversational_message(
-        request.message,
-        request.history,
-        user_class=user_class,
-    )
-    if conversational_response:
-        return ChatResponse(response=conversational_response)
+    if not pending_request:
+        conversational_response = groq_service.maybe_answer_conversational_message(
+            request.message,
+            request.history,
+            user_class=user_class,
+        )
+        if conversational_response:
+            return ChatResponse(response=conversational_response)
 
     response = agent.process_question(full_question)
     return ChatResponse(response=response)
