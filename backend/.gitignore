@@ -21,7 +21,8 @@ ENV/
 
 # Models cache
 .cache/
-models/
+!/app/models/
+!/app/models/**
 
 # Logs
 *.log
