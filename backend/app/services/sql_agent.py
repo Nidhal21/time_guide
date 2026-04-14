@@ -1866,7 +1866,14 @@ class SQLAgent:
     def _teacher_prof_schedule_sql(self, question: str, context: dict) -> Tuple[str, Dict[str, Any]]:
         prof_name = self._extract_schedule_prof_candidate(question) or self._extract_prof_candidate(question) or ""
         prof_name = self._resolve_professor_name(prof_name) or prof_name
-        prof_condition = self._best_professor_match_condition(prof_name, "te.professeur_nom_complet") or "1=0"
+        prof_condition = self._best_professor_match_condition(prof_name, "te.professeur_nom_complet")
+        if not prof_condition:
+            fallback_key = "".join(self._normalized_token_parts(self._clean_professor_display_name(prof_name)))
+            if fallback_key:
+                expr = "REPLACE(REPLACE(REPLACE(LOWER(te.professeur_nom_complet), ' ', ''), '.', ''), '-', '')"
+                prof_condition = f"{expr} = '{fallback_key}'"
+            else:
+                prof_condition = "1=0"
         requested_day = self._extract_requested_day(question, context)
         sql = f"""
         SELECT
@@ -1897,7 +1904,14 @@ class SQLAgent:
     def _seance_prof_schedule_sql(self, question: str, context: dict) -> Tuple[str, Dict[str, Any]]:
         prof_name = self._extract_schedule_prof_candidate(question) or self._extract_prof_candidate(question) or ""
         prof_name = self._resolve_professor_name(prof_name) or prof_name
-        prof_condition = self._best_professor_match_condition(prof_name, "p.nom_complet") or "1=0"
+        prof_condition = self._best_professor_match_condition(prof_name, "p.nom_complet")
+        if not prof_condition:
+            fallback_key = "".join(self._normalized_token_parts(self._clean_professor_display_name(prof_name)))
+            if fallback_key:
+                expr = "REPLACE(REPLACE(REPLACE(LOWER(p.nom_complet), ' ', ''), '.', ''), '-', '')"
+                prof_condition = f"{expr} = '{fallback_key}'"
+            else:
+                prof_condition = "1=0"
         requested_day = self._extract_requested_day(question, context)
 
         sql = f"""
