@@ -1894,6 +1894,55 @@ class SQLAgent:
         sql += " ORDER BY CASE LOWER(te.jour) WHEN 'lundi' THEN 1 WHEN 'mardi' THEN 2 WHEN 'mercredi' THEN 3 WHEN 'jeudi' THEN 4 WHEN 'vendredi' THEN 5 WHEN 'samedi' THEN 6 WHEN 'dimanche' THEN 7 ELSE 8 END, te.heure_debut, te.heure_fin;"
         return sql, params
 
+    def _seance_prof_schedule_sql(self, question: str, context: dict) -> Tuple[str, Dict[str, Any]]:
+        prof_name = self._extract_schedule_prof_candidate(question) or self._extract_prof_candidate(question) or ""
+        prof_name = self._resolve_professor_name(prof_name) or prof_name
+        prof_condition = self._best_professor_match_condition(prof_name, "p.nom_complet") or "1=0"
+        requested_day = self._extract_requested_day(question, context)
+
+        sql = f"""
+        SELECT
+            c.nom AS classe,
+            m.nom AS matiere,
+            p.nom_complet AS professeur,
+            sa.nom AS salle,
+            s.jour,
+            s.heure_debut,
+            s.heure_fin,
+            s.type_seance
+        FROM seances s
+        JOIN emplois_versions v ON v.id = s.version_id AND v.actif = true AND v.classe_id = s.classe_id
+        JOIN professeurs p ON p.id = s.professeur_id
+        LEFT JOIN classes c ON c.id = s.classe_id
+        LEFT JOIN matieres m ON m.id = s.matiere_id
+        LEFT JOIN salles sa ON sa.id = s.salle_id
+        WHERE {prof_condition}
+        """
+        params: Dict[str, Any] = {}
+        requested_periode = self._schedule_periode_name(question, context)
+        if requested_periode and context.get("semestre_id"):
+            sql += """
+            AND s.periode_id = (
+                SELECT p2.id
+                FROM periodes p2
+                WHERE p2.semestre_id = :semester_id
+                  AND UPPER(p2.nom) = :periode_nom
+                LIMIT 1
+            )\n
+            """
+            params["semester_id"] = int(context["semestre_id"])
+            params["periode_nom"] = requested_periode
+        if requested_day:
+            sql += " AND LOWER(s.jour) = LOWER(:target_day)\n"
+            params["target_day"] = requested_day
+        sql += (
+            " ORDER BY CASE LOWER(s.jour) "
+            "WHEN 'lundi' THEN 1 WHEN 'mardi' THEN 2 WHEN 'mercredi' THEN 3 "
+            "WHEN 'jeudi' THEN 4 WHEN 'vendredi' THEN 5 WHEN 'samedi' THEN 6 "
+            "WHEN 'dimanche' THEN 7 ELSE 8 END, s.heure_debut, s.heure_fin;"
+        )
+        return sql, params
+
     def _schedule_periode_name(self, question: str, context: dict) -> Optional[str]:
         q = (question or "").lower()
         want_p1 = bool(re.search(r"\bp\s*1\b", q))
@@ -2990,7 +3039,10 @@ class SQLAgent:
             prof = self._extract_schedule_prof_candidate(question) or self._extract_prof_candidate(question)
             if prof and not self._prof_exists_in_db(prof):
                 return None, {}, self._prof_not_found_message(prof)
-            sql_query, params = self._teacher_prof_schedule_sql(question, context) if self._teacher_prof_exists_in_db(prof or "") else ("", {})
+            if self._teacher_prof_exists_in_db(prof or ""):
+                sql_query, params = self._teacher_prof_schedule_sql(question, context)
+            else:
+                sql_query, params = self._seance_prof_schedule_sql(question, context)
             return sql_query, params, None
 
         return None, {}, None
@@ -3204,9 +3256,11 @@ class SQLAgent:
                 return confirmation
             if prof and not self._prof_exists_in_db(prof):
                 return self._prof_not_found_message(prof)
-            sql_query, params = self._teacher_prof_schedule_sql(question, context) if self._teacher_prof_exists_in_db(prof or "") else ("", {})
-            if sql_query:
-                return self._exec_and_format(question, sql_query, params, context)
+            if self._teacher_prof_exists_in_db(prof or ""):
+                sql_query, params = self._teacher_prof_schedule_sql(question, context)
+            else:
+                sql_query, params = self._seance_prof_schedule_sql(question, context)
+            return self._exec_and_format(question, sql_query, params, context)
 
         if self._is_prof_location_question(question):
             prof = self._extract_prof_candidate(question)
