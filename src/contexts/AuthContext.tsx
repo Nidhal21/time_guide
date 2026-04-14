@@ -1,6 +1,7 @@
 import { createContext, useContext, useEffect, useState, ReactNode } from "react";
+import { getApiBaseUrl } from "@/lib/utils";
 
-const API_URL = import.meta.env.VITE_API_URL ?? "http://127.0.0.1:8000/api";
+const API_URL = getApiBaseUrl();
 const STORAGE_KEY = "auth_token";
 
 export interface AuthUser {

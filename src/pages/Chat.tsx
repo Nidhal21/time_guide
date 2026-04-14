@@ -6,6 +6,7 @@ import TypingIndicator from "@/components/chat/TypingIndicator";
 import WelcomeScreen from "@/components/chat/WelcomeScreen";
 import ChatSidebar from "@/components/chat/ChatSidebar";
 import { useAuth } from "@/contexts/AuthContext";
+import { getApiBaseUrl } from "@/lib/utils";
 import { LogOut, MessageSquareText, ShieldCheck } from "lucide-react";
 
 interface Message {
@@ -15,7 +16,7 @@ interface Message {
   timestamp: string;
 }
 
-const API_URL = import.meta.env.VITE_API_URL ?? "http://127.0.0.1:8000/api";
+const API_URL = getApiBaseUrl();
 
 const Chat = () => {
   const [messages, setMessages] = useState<Message[]>([]);
