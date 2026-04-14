@@ -4,8 +4,10 @@ from app.services.intent_router import ExecutionTarget, IntentLabel, IntentRoute
 
 
 class DummyGroqService:
-    def __init__(self, classify_result="NON_ACADEMIC"):
+    def __init__(self, classify_result="NON_ACADEMIC", assistant_intent=None, analysis_result=None):
         self.classify_result = classify_result
+        self.assistant_intent = assistant_intent
+        self.analysis_result = analysis_result
 
     def is_obvious_academic_request(self, message: str) -> bool:
         normalized = (message or "").lower()
@@ -17,6 +19,12 @@ class DummyGroqService:
 
     def classify_message_mode(self, message: str, history=None):
         return self.classify_result
+
+    def classify_assistant_intent(self, message: str, history=None):
+        return self.assistant_intent
+
+    def analyze_user_message(self, message: str, history=None):
+        return self.analysis_result
 
 
 class DummyAgent:
@@ -137,12 +145,211 @@ class IntentRouterTests(unittest.TestCase):
         self.assertEqual(decision.execution_target, ExecutionTarget.SMALLTALK.value)
 
     def test_low_confidence_model_academic_route_requests_clarification(self):
-        router = IntentRouter(DummyGroqService(classify_result="ACADEMIC"))
+        router = IntentRouter(DummyGroqService(classify_result="ACADEMIC", assistant_intent="TIMETABLE"))
         decision = router.route("je veux savoir", history=[], user_class=None, agent=DummyAgent())
 
         self.assertEqual(decision.execution_target, ExecutionTarget.CLARIFICATION.value)
         self.assertTrue(decision.needs_clarification)
         self.assertIn("reformuler", decision.direct_response or "")
+
+    def test_model_detected_enetcom_info_goes_to_university_service(self):
+        router = IntentRouter(DummyGroqService(assistant_intent="ENETCOM_INFO"))
+
+        decision = router.route("comment fonctionne le club robotique", history=[], user_class=None, agent=DummyAgent())
+
+        self.assertEqual(decision.intent, IntentLabel.UNIVERSITY_INFO.value)
+        self.assertEqual(decision.execution_target, ExecutionTarget.UNIVERSITY_SERVICE.value)
+        self.assertEqual(decision.source, "model_classification")
+
+    def test_model_detected_greeting_goes_to_smalltalk(self):
+        router = IntentRouter(DummyGroqService(assistant_intent="GREETING"))
+
+        decision = router.route("wesh tu peux faire quoi", history=[], user_class=None, agent=DummyAgent())
+
+        self.assertEqual(decision.intent, IntentLabel.CHAT_SMALLTALK.value)
+        self.assertEqual(decision.execution_target, ExecutionTarget.SMALLTALK.value)
+        self.assertEqual(decision.source, "model_classification")
+
+    def test_structured_model_analysis_routes_professor_location(self):
+        router = IntentRouter(
+            DummyGroqService(
+                analysis_result={
+                    "intent": "PROF_LOCATION",
+                    "answer_source": "DATABASE",
+                    "confidence": 0.91,
+                    "standalone_query": "ou se trouve KHALFALLAH Ali aujourd'hui",
+                    "class_name": None,
+                    "professor_name": "KHALFALLAH Ali",
+                    "room_name": None,
+                    "day_hint": "aujourd'hui",
+                    "time_hint": "maintenant",
+                    "university_topic": None,
+                }
+            )
+        )
+
+        decision = router.route("ou est ali maintenant", history=[], user_class=None, agent=DummyAgent())
+
+        self.assertEqual(decision.intent, IntentLabel.PROF_LOCATION.value)
+        self.assertEqual(decision.execution_target, ExecutionTarget.SQL_AGENT.value)
+        self.assertEqual(decision.source, "model_analysis")
+        self.assertEqual(decision.entities.professor_candidate, "KHALFALLAH Ali")
+        self.assertEqual(decision.full_question, "ou se trouve KHALFALLAH Ali aujourd'hui")
+
+    def test_structured_model_analysis_routes_enetcom_info(self):
+        router = IntentRouter(
+            DummyGroqService(
+                analysis_result={
+                    "intent": "ENETCOM_INFO",
+                    "answer_source": "UNIVERSITY_SITE",
+                    "confidence": 0.94,
+                    "standalone_query": "clubs et vie associative a ENET'Com",
+                    "class_name": None,
+                    "professor_name": None,
+                    "room_name": None,
+                    "day_hint": None,
+                    "time_hint": None,
+                    "university_topic": "clubs",
+                }
+            )
+        )
+
+        decision = router.route("parle moi des clubs", history=[], user_class=None, agent=DummyAgent())
+
+        self.assertEqual(decision.intent, IntentLabel.UNIVERSITY_INFO.value)
+        self.assertEqual(decision.execution_target, ExecutionTarget.UNIVERSITY_SERVICE.value)
+        self.assertEqual(decision.source, "model_analysis")
+        self.assertEqual(decision.entities.university_topic, "clubs")
+        self.assertEqual(decision.full_question, "clubs et vie associative a ENET'Com")
+
+    def test_model_analysis_reinterprets_fake_class_as_professor_schedule(self):
+        router = IntentRouter(
+            DummyGroqService(
+                analysis_result={
+                    "intent": "CLASS_SCHEDULE",
+                    "confidence": 0.8,
+                    "class_name": "emploi",
+                    "professor_name": "Ali Khalflah",
+                    "room_name": None,
+                    "day_hint": None,
+                    "time_hint": None,
+                    "university_topic": None,
+                }
+            )
+        )
+
+        decision = router.route("emploi ali khalflah", history=[], user_class=None, agent=DummyAgent())
+
+        self.assertEqual(decision.intent, IntentLabel.PROF_SCHEDULE.value)
+        self.assertEqual(decision.execution_target, ExecutionTarget.SQL_AGENT.value)
+        self.assertIsNone(decision.entities.class_candidate)
+
+    def test_model_analysis_with_fake_room_drops_to_clarification(self):
+        router = IntentRouter(
+            DummyGroqService(
+                analysis_result={
+                    "intent": "ROOM_CURRENT_TEACHER",
+                    "confidence": 0.8,
+                    "class_name": None,
+                    "professor_name": None,
+                    "room_name": "C11",
+                    "day_hint": "demain",
+                    "time_hint": "tomorrow",
+                    "university_topic": None,
+                }
+            )
+        )
+
+        decision = router.route("qui sera basent demain", history=[], user_class=None, agent=DummyAgent())
+
+        self.assertEqual(decision.execution_target, ExecutionTarget.CLARIFICATION.value)
+        self.assertTrue(decision.needs_clarification)
+
+    def test_room_shorthand_is_detected_from_message(self):
+        router = IntentRouter(
+            DummyGroqService(
+                analysis_result={
+                    "intent": "ROOM_SCHEDULE",
+                    "answer_source": "DATABASE",
+                    "confidence": 0.9,
+                    "standalone_query": "emploi du temps de salle C11",
+                    "class_name": None,
+                    "professor_name": None,
+                    "room_name": "C11",
+                    "day_hint": None,
+                    "time_hint": None,
+                    "university_topic": None,
+                }
+            )
+        )
+
+        decision = router.route("emploi c11", history=[], user_class=None, agent=DummyAgent())
+
+        self.assertEqual(decision.intent, IntentLabel.ROOM_SCHEDULE.value)
+        self.assertEqual(decision.execution_target, ExecutionTarget.SQL_AGENT.value)
+        self.assertEqual(decision.entities.room_candidate, "C11")
+        self.assertEqual(decision.full_question, "emploi du temps de salle C11")
+
+    def test_self_identified_professor_has_course_question_is_routed_as_prof(self):
+        router = IntentRouter(
+            DummyGroqService(),
+            db=FakeDb(class_names=[], professor_names=["KHALFALLAH Ali"]),
+        )
+
+        decision = router.route("je suis ali khalflah est ce jai cours demain", history=[], user_class=None, agent=DummyAgent())
+
+        self.assertEqual(decision.intent, IntentLabel.PROF_HAS_COURSE.value)
+        self.assertEqual(decision.execution_target, ExecutionTarget.SQL_AGENT.value)
+        self.assertEqual(decision.entities.professor_candidate, "KHALFALLAH Ali")
+
+    def test_model_professor_name_is_canonicalized_from_database(self):
+        router = IntentRouter(
+            DummyGroqService(
+                analysis_result={
+                    "intent": "PROF_SCHEDULE",
+                    "answer_source": "DATABASE",
+                    "confidence": 0.9,
+                    "standalone_query": "emploi du temps de BEN SLIMA Mohamed",
+                    "class_name": None,
+                    "professor_name": "Mohamed Ben Slima",
+                    "room_name": None,
+                    "day_hint": None,
+                    "time_hint": None,
+                    "university_topic": None,
+                }
+            ),
+            db=FakeDb(class_names=[], professor_names=["BEN SLIMA Mohamed"]),
+        )
+
+        decision = router.route("emploi de mohamed ben slima", history=[], user_class=None, agent=DummyAgent())
+
+        self.assertEqual(decision.intent, IntentLabel.PROF_SCHEDULE.value)
+        self.assertEqual(decision.entities.professor_candidate, "BEN SLIMA Mohamed")
+
+    def test_noisy_professor_schedule_from_model_is_not_blocked_when_query_is_clear(self):
+        router = IntentRouter(
+            DummyGroqService(
+                analysis_result={
+                    "intent": "PROF_SCHEDULE",
+                    "answer_source": "DATABASE",
+                    "confidence": 0.55,
+                    "standalone_query": "emploi du temps de KHALFALLAH Ali",
+                    "class_name": None,
+                    "professor_name": "KHALFALLAH Ali",
+                    "room_name": None,
+                    "day_hint": None,
+                    "time_hint": None,
+                    "university_topic": None,
+                }
+            ),
+            db=FakeDb(class_names=[], professor_names=["KHALFALLAH Ali"]),
+        )
+
+        decision = router.route("emplois dee tmeps ali khalflah", history=[], user_class=None, agent=DummyAgent())
+
+        self.assertEqual(decision.intent, IntentLabel.PROF_SCHEDULE.value)
+        self.assertEqual(decision.execution_target, ExecutionTarget.SQL_AGENT.value)
+        self.assertEqual(decision.full_question, "emploi du temps de KHALFALLAH Ali")
 
     def test_router_extracts_available_classes_from_database(self):
         router = IntentRouter(
@@ -231,12 +438,38 @@ class IntentRouterTests(unittest.TestCase):
         self.assertEqual(decision.intent, IntentLabel.PROF_SCHEDULE.value)
         self.assertEqual(decision.source, "conversation_state")
 
+    def test_professor_class_confirmation_keeps_prof_class_intent(self):
+        router = IntentRouter(
+            DummyGroqService(),
+            db=FakeDb(class_names=[], professor_names=["ELLOUZE Nebrasse", "ELLOUZE Adnene", "ELLOUZE Hanene"]),
+        )
+        history = [
+            {"role": "user", "content": "dans quel classe existe nebrasse ellouz demain"},
+            {
+                "role": "assistant",
+                "content": "Le nom 'Nebrasse Ellouz' est ambigu. Voulez-vous dire : ELLOUZE Nebrasse, ELLOUZE Adnene, ELLOUZE Hanene ?",
+            },
+        ]
+
+        decision = router.route("ELLOUZE Nebrasse", history=history, user_class=None, agent=DummyAgent())
+
+        self.assertEqual(decision.intent, IntentLabel.PROF_CLASS.value)
+        self.assertEqual(decision.execution_target, ExecutionTarget.SQL_AGENT.value)
+        self.assertEqual(decision.full_question, "dans quelle classe se trouve ELLOUZE Nebrasse demain")
+
     def test_calendar_request_is_routed_without_falling_to_out_of_scope(self):
         decision = self.router.route("les jours ferier prochaines", history=[], user_class=None, agent=DummyAgent())
 
         self.assertEqual(decision.intent, IntentLabel.CALENDAR.value)
         self.assertEqual(decision.execution_target, ExecutionTarget.SQL_AGENT.value)
         self.assertEqual(decision.entities.university_topic, "calendar")
+
+    def test_absent_question_is_routed_to_university_service_without_model(self):
+        decision = self.router.route("qui est absent ?", history=[], user_class=None, agent=DummyAgent())
+
+        self.assertEqual(decision.intent, IntentLabel.UNIVERSITY_INFO.value)
+        self.assertEqual(decision.execution_target, ExecutionTarget.UNIVERSITY_SERVICE.value)
+        self.assertEqual(decision.entities.university_topic, "absence")
 
     def test_all_classes_question_is_not_routed_to_university_general_info(self):
         router = IntentRouter(

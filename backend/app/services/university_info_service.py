@@ -147,6 +147,13 @@ class UniversityInfoService:
         markers = [
             "absence",
             "absences",
+            "absent",
+            "absente",
+            "absents",
+            "absentes",
+            "qui est absent",
+            "qui est absente",
+            "qui sont absents",
             "dabsence",
             "avis dabsence",
             "avis d absence",

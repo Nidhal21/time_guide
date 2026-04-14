@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 import unicodedata
@@ -124,6 +125,12 @@ class GroqService:
         else:
             self.enabled = True
             print(f"Groq API initialized with {self.model}")
+
+    def _handle_auth_error(self, response: requests.Response, context: str) -> None:
+        if response.status_code != 401:
+            return
+        print(f"{context}: invalid API key detected, disabling Groq service until restart.")
+        self.enabled = False
 
     # --- Helpers ---
 
@@ -288,6 +295,7 @@ Last user message:
         )
         if response is None or response.status_code != 200:
             if response is not None:
+                self._handle_auth_error(response, "Groq intent classification error")
                 print(f"Groq intent classification error: {response.status_code} - {response.text}")
             return None
 
@@ -302,6 +310,273 @@ Last user message:
             return "NON_ACADEMIC"
         return None
 
+    def _classify_assistant_intent(self, message: str, history: Optional[list] = None) -> Optional[str]:
+        if not self.enabled:
+            return None
+
+        history_text = self._history_as_text(history)
+        prompt = f"""Classify the last user message for an ENET'Com assistant.
+
+Return exactly one label:
+- GREETING: greeting, thanks, casual conversation, asking who the assistant is, or asking what it can do
+- TIMETABLE: timetable, classes, rooms, teachers, courses, absences, exams, holidays, or schedule-related requests
+- ENETCOM_INFO: ENET'Com information such as departments, contact, administration, studies, student services, clubs, internships, PFE, news, or website information
+- OUT_OF_SCOPE: requests unrelated to ENET'Com
+
+Rules:
+- If the message mixes a greeting with a real ENET'Com request, choose the request label, not GREETING.
+- Short follow-ups like "et demain ?", "pour gii", or "et les contacts ?" should use recent history to infer the most likely ENET'Com intent.
+- If you are unsure between TIMETABLE and ENETCOM_INFO, use TIMETABLE only for schedule/class/room/teacher/calendar needs. Otherwise use ENETCOM_INFO.
+- Return only the label, nothing else.
+
+Examples:
+- "bonjour" -> GREETING
+- "salut, tu peux faire quoi ?" -> GREETING
+- "merci beaucoup" -> GREETING
+- "bonjour, j'ai quoi demain ?" -> TIMETABLE
+- "ou est mr ben amor maintenant" -> TIMETABLE
+- "salle libre aujourd'hui" -> TIMETABLE
+- "donne moi le contact de l'ecole" -> ENETCOM_INFO
+- "quelles sont les actualites d'enetcom" -> ENETCOM_INFO
+- "plan d'etude gii" -> ENETCOM_INFO
+- "quel est le prix de l'or" -> OUT_OF_SCOPE
+
+Recent history:
+{history_text or "None"}
+
+Last user message:
+{message}
+"""
+
+        response = self._post_with_retry(
+            {
+                "model": self.model,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": "You classify requests for an ENET'Com assistant. Return exactly one label: GREETING, TIMETABLE, ENETCOM_INFO, or OUT_OF_SCOPE.",
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                "temperature": 0.0,
+                "max_tokens": 12,
+            },
+            timeout=15,
+        )
+        if response is None or response.status_code != 200:
+            if response is not None:
+                self._handle_auth_error(response, "Groq assistant intent classification error")
+                print(f"Groq assistant intent classification error: {response.status_code} - {response.text}")
+            return None
+
+        payload = self._safe_json(response)
+        if not payload:
+            return None
+
+        raw = (payload.get("choices", [{}])[0].get("message", {}).get("content", "") or "").strip().upper()
+        for label in ("GREETING", "TIMETABLE", "ENETCOM_INFO", "OUT_OF_SCOPE"):
+            if label in raw:
+                return label
+        return None
+
+    def classify_assistant_intent(self, message: str, history: Optional[list] = None) -> Optional[str]:
+        return self._classify_assistant_intent(message, history)
+
+    def _extract_json_object(self, raw: str) -> Optional[Dict[str, Any]]:
+        text = (raw or "").strip()
+        if not text:
+            return None
+        try:
+            parsed = json.loads(text)
+            return parsed if isinstance(parsed, dict) else None
+        except Exception:
+            pass
+
+        start = text.find("{")
+        end = text.rfind("}")
+        if start == -1 or end == -1 or end <= start:
+            return None
+        try:
+            parsed = json.loads(text[start:end + 1])
+            return parsed if isinstance(parsed, dict) else None
+        except Exception:
+            return None
+
+    def _analyze_user_message(self, message: str, history: Optional[list] = None) -> Optional[Dict[str, Any]]:
+        if not self.enabled:
+            return None
+
+        history_text = self._history_as_text(history)
+        prompt = f"""You are the query-understanding engine for an ENET'Com assistant.
+
+Return exactly one JSON object that captures the user's intended ENET'Com request.
+
+Mission:
+- Understand meaning, not spelling.
+- The user may write with typos, phonetic spelling, missing accents, merged/split words, repeated letters, omitted words, or shorthand.
+- Recover the intended request whenever the meaning is reasonably inferable from the latest message and relevant history.
+
+ENET'Com scope:
+- Timetables and schedules for classes, professors, and rooms
+- Professor location, current course, teaching class, or whether a professor has class
+- Available rooms
+- Academic calendar: holidays, exams, revision periods, dates
+- Institutional information: study plans, formations, departments, contacts, clubs, internships, PFE, services, absences, news, official website information
+- Small talk: greeting, thanks, politeness, capability questions
+
+Valid intent values:
+- GREETING
+- CLASS_SCHEDULE
+- CLASS_LOCATION
+- PROF_SCHEDULE
+- PROF_LOCATION
+- PROF_CLASS
+- PROF_CURRENT_COURSE
+- PROF_HAS_COURSE
+- ROOM_CURRENT_TEACHER
+- ROOM_SCHEDULE
+- AVAILABLE_ROOMS
+- ENETCOM_INFO
+- CALENDAR
+- ALL_CLASSES
+- OUT_OF_SCOPE
+- UNKNOWN
+
+Valid answer_source values:
+- DATABASE
+- UNIVERSITY_SITE
+- SMALLTALK
+- OUT_OF_SCOPE
+
+Decision rules:
+- Use recent history only to resolve omitted references or short follow-ups.
+- If the latest message contains both small talk and a real request, choose the real request.
+- If the request is timetable/room/professor/class related, answer_source must be DATABASE.
+- If the request is about official ENET'Com information, answer_source must be UNIVERSITY_SITE.
+- If the request is casual conversation, answer_source must be SMALLTALK.
+- If unrelated to ENET'Com, answer_source must be OUT_OF_SCOPE.
+
+Intent rules:
+- ROOM_CURRENT_TEACHER: user asks who teaches in a room now/currently.
+- ROOM_SCHEDULE: user asks for the timetable/schedule of a room.
+- AVAILABLE_ROOMS: user asks which rooms are free/available.
+- CLASS_LOCATION: user asks where a class is located.
+- PROF_LOCATION: user asks where a professor is located.
+- PROF_CLASS: user asks which class a professor teaches or where that professor is teaching.
+- PROF_CURRENT_COURSE: user asks what course a professor is teaching now.
+- PROF_HAS_COURSE: user asks whether a professor has class/course on a given day/time.
+- CALENDAR: holidays, exams, revision periods, academic dates.
+- ENETCOM_INFO: institutional information outside the calendar.
+
+Entity rules:
+- Fill class_name only when the request supports a class/group target.
+- Fill professor_name only when the request supports a person/professor target.
+- Fill room_name only when the request supports a room target.
+- Fill day_hint/time_hint when the message implies today, tomorrow, now, a weekday, or equivalent timing.
+- Fill university_topic only for institutional topics such as study_plan, absence, contact, department, formation, clubs, pfe, internship, news, services, or similar.
+
+Strict negative rules:
+- Never invent a class, professor, room, or topic unsupported by the latest message plus necessary context.
+- Never copy an entity from history if the new message points to a different target.
+- For GREETING or OUT_OF_SCOPE, all entity fields must be null and standalone_query must be null.
+- Never output professor_name if the request only supports a room or class target.
+- Never output room_name if the request only supports a professor or class target.
+- Never output class_name if the request only supports a professor or room target.
+
+Ambiguity rules:
+- If a timetable request is ambiguous, prefer:
+  - PROF_* when the target looks like a person's name
+  - ROOM_* when the target looks like a room code
+  - CLASS_* when the target looks like a class/group code
+- If the exact subtype is uncertain but the request is clearly timetable-related, choose the closest DATABASE intent and lower confidence.
+- Prefer a low-confidence meaningful ENET'Com interpretation over OUT_OF_SCOPE when the intended meaning is reasonably recoverable.
+
+Rewrite rules:
+- standalone_query must be a clean autonomous ENET'Com query in French.
+- standalone_query must preserve the user's meaning while correcting noisy spelling when recoverable.
+- standalone_query must explicitly mention the resolved class, professor, room, day, time, or institutional topic when known.
+- If the message is noisy but understandable, output the corrected interpretation in standalone_query, not the noisy wording.
+- For GREETING or OUT_OF_SCOPE, standalone_query must be null.
+
+Confidence rules:
+- confidence must be a number between 0 and 1.
+- High confidence only when meaning and target are reasonably clear.
+- Lower confidence when ambiguity remains after contextual interpretation.
+
+Return only this JSON schema:
+{{
+  "intent": "ONE_OF_THE_VALUES_ABOVE",
+  "answer_source": "DATABASE_OR_UNIVERSITY_SITE_OR_SMALLTALK_OR_OUT_OF_SCOPE",
+  "confidence": 0.0,
+  "standalone_query": null,
+  "class_name": null,
+  "professor_name": null,
+  "room_name": null,
+  "day_hint": null,
+  "time_hint": null,
+  "university_topic": null
+}}
+
+Recent history:
+{history_text or "None"}
+
+Last user message:
+{message}
+"""
+
+        response = self._post_with_retry(
+            {
+                "model": self.model,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": "You understand ENET'Com user requests, choose the correct answer source, and return exactly one JSON object with the requested schema.",
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                "temperature": 0.0,
+                "max_tokens": 320,
+                "response_format": {"type": "json_object"},
+            },
+            timeout=20,
+        )
+        if response is None or response.status_code != 200:
+            if response is not None:
+                self._handle_auth_error(response, "Groq structured analysis error")
+                print(f"Groq structured analysis error: {response.status_code} - {response.text}")
+            return None
+
+        payload = self._safe_json(response)
+        if not payload:
+            return None
+
+        raw = (payload.get("choices", [{}])[0].get("message", {}).get("content", "") or "").strip()
+        parsed = self._extract_json_object(raw)
+        if not parsed:
+            return None
+
+        intent = str(parsed.get("intent") or "").strip().upper()
+        if not intent:
+            return None
+        parsed["intent"] = intent
+
+        try:
+            parsed["confidence"] = float(parsed.get("confidence", 0.0) or 0.0)
+        except Exception:
+            parsed["confidence"] = 0.0
+        parsed["confidence"] = max(0.0, min(1.0, parsed["confidence"]))
+
+        parsed["answer_source"] = str(parsed.get("answer_source") or "").strip().upper() or None
+
+        for field in ("standalone_query", "class_name", "professor_name", "room_name", "day_hint", "time_hint", "university_topic"):
+            value = parsed.get(field)
+            parsed[field] = str(value).strip() if value not in (None, "", "null") else None
+
+        return parsed
+
+    def analyze_user_message(self, message: str, history: Optional[list] = None) -> Optional[Dict[str, Any]]:
+        return self._analyze_user_message(message, history)
+
     def classify_message_mode(self, message: str, history: Optional[list] = None) -> Optional[str]:
         return self._classify_message_mode(message, history)
 
@@ -312,7 +587,14 @@ Last user message:
         thanks_detected = self._contains_marker(q, THANKS_MARKERS)
         help_detected = self._contains_marker(q, HELP_MARKERS)
         tokens = q.split()
-        status_detected = "ca va" in q or q.replace(" ", "") in {"cv", "cava"} or "cv" in tokens or "cava" in tokens
+        status_detected = (
+            "ca va" in q
+            or "comment vas tu" in q
+            or "comment va tu" in q
+            or q.replace(" ", "") in {"cv", "cava", "commentvastu"}
+            or "cv" in tokens
+            or "cava" in tokens
+        )
 
         if not q:
             return "Bonjour. Je peux vous aider avec l'emploi du temps, les salles, les professeurs, les absences et les informations ENET'Com."
@@ -393,6 +675,7 @@ Dernier message utilisateur:
         )
         if response is None or response.status_code != 200:
             if response is not None:
+                self._handle_auth_error(response, "Groq conversation error")
                 print(f"Groq conversation error: {response.status_code} - {response.text}")
             return self._fallback_out_of_scope_response(message)
 
@@ -463,6 +746,7 @@ Dernier message utilisateur:
         )
         if response is None or response.status_code != 200:
             if response is not None:
+                self._handle_auth_error(response, "Groq conversation error")
                 print(f"Groq conversation error: {response.status_code} - {response.text}")
             return self._fallback_out_of_scope_response(message)
 

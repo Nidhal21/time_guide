@@ -249,6 +249,26 @@ class ChatApiWeekdaySmokeTests(unittest.TestCase):
         answer_mock.assert_called_once_with("plan de etude gii")
         process_mock.assert_not_called()
 
+    def test_absent_question_is_sent_directly_to_university_service(self):
+        with patch.object(
+            university_info_service,
+            "answer_question",
+            return_value="Liste absences",
+        ) as answer_mock, patch("app.routes.chat.SQLAgent.process_routed_question") as process_mock:
+            response = self.client.post(
+                "/api/chat",
+                json={
+                    "message": "qui est absent ?",
+                    "user_role": "student",
+                    "history": [],
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["response"], "Liste absences")
+        answer_mock.assert_called_once_with("qui est absent ?")
+        process_mock.assert_not_called()
+
     def test_study_plan_request_ignores_pending_history_and_still_goes_to_university_service(self):
         history = [
             {"role": "user", "content": "emploi de temps"},

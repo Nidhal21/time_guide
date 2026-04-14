@@ -62,6 +62,7 @@ class ConversationState:
     last_university_topic: Optional[str] = None
     last_user_message: Optional[str] = None
     pending_slot: Optional[str] = None
+    pending_intent: Optional[str] = None
     pending_original_question: Optional[str] = None
     pending_assistant_message: Optional[str] = None
 
@@ -98,6 +99,22 @@ class IntentDecision:
 
 class IntentRouter:
     CLASS_SHORTHAND_CODES = {"GII", "GEC", "GT", "IDSD", "INFO", "TELECOM"}
+    GENERIC_ENTITY_STOPWORDS = {
+        "emploi",
+        "emploi du temps",
+        "temps",
+        "classe",
+        "prof",
+        "professeur",
+        "enseignant",
+        "salle",
+        "cours",
+        "demain",
+        "aujourd hui",
+        "aujourd",
+        "maintenant",
+        "enetcom",
+    }
     YES_MARKERS = {"oui", "yes", "ok", "daccord", "d accord", "d'accord"}
     NO_MARKERS = {"non", "no"}
     EXECUTION_CONFIDENCE_THRESHOLD = 0.75
@@ -127,6 +144,13 @@ class IntentRouter:
             "lavis dabsence",
             "absence",
             "absences",
+            "absent",
+            "absente",
+            "absents",
+            "absentes",
+            "qui est absent",
+            "qui est absente",
+            "qui sont absents",
             "prof absent",
             "profs absents",
             "enseignants absents",
@@ -188,7 +212,7 @@ class IntentRouter:
         "professor_location": ("ou se trouve", "se trouve", "dans quelle salle", "est ou"),
         "professor_class": ("dans quelle classe", "quelle classe", "pour quelle classe", "classe se trouve"),
         "professor_current_course": ("quel cours", "quelle matiere", "fait", "enseigne"),
-        "professor_has_course": ("a cours", "a un cours", "a t il cours", "a elle cours", "est ce qu il a cours", "est ce qu elle a cours"),
+        "professor_has_course": ("a cours", "a un cours", "a t il cours", "a elle cours", "est ce qu il a cours", "est ce qu elle a cours", "jai cours", "j ai cours", "ai je cours", "est ce jai cours", "est ce que jai cours"),
         "available_rooms": ("dispon", "diponn", "libre", "vide"),
         "room_current_teacher": ("qui enseigne",),
         "time_now": ("maintenant", "actuellement", "mtn", "en ce moment"),
@@ -266,6 +290,23 @@ class IntentRouter:
                 self._finalize_academic_decision(contextual_followup_decision, resolved_user_class, agent)
             )
 
+        model_analysis = None
+        if hasattr(self.groq_service, "analyze_user_message"):
+            model_analysis = self.groq_service.analyze_user_message(message, history)
+        model_decision = self._decision_from_model_analysis(
+            analysis=model_analysis,
+            normalized_message=normalized_message,
+            entities=entities,
+            state=state,
+            message=message,
+        )
+        if model_decision:
+            if model_decision.execution_target == ExecutionTarget.SQL_AGENT.value:
+                return self._apply_confidence_policy(
+                    self._finalize_academic_decision(model_decision, resolved_user_class, agent)
+                )
+            return self._apply_confidence_policy(model_decision)
+
         if self._is_simple_conversation(message):
             return self._apply_confidence_policy(IntentDecision(
                 intent=IntentLabel.CHAT_SMALLTALK.value,
@@ -310,6 +351,57 @@ class IntentRouter:
             )
             return self._apply_confidence_policy(self._finalize_academic_decision(decision, resolved_user_class, agent))
 
+        assistant_intent = None
+        if hasattr(self.groq_service, "classify_assistant_intent"):
+            assistant_intent = self.groq_service.classify_assistant_intent(message, history)
+
+        if assistant_intent == "GREETING":
+            return self._apply_confidence_policy(IntentDecision(
+                intent=IntentLabel.CHAT_SMALLTALK.value,
+                execution_target=ExecutionTarget.SMALLTALK.value,
+                source="model_classification",
+                confidence=0.9,
+                normalized_message=normalized_message,
+                entities=entities,
+                state=state,
+            ))
+
+        if assistant_intent == "ENETCOM_INFO":
+            return self._apply_confidence_policy(IntentDecision(
+                intent=IntentLabel.UNIVERSITY_INFO.value,
+                execution_target=ExecutionTarget.UNIVERSITY_SERVICE.value,
+                source="model_classification",
+                confidence=0.82,
+                normalized_message=normalized_message,
+                entities=entities,
+                state=state,
+                full_question=message,
+            ))
+
+        if assistant_intent == "TIMETABLE":
+            decision = IntentDecision(
+                intent=IntentLabel.ACADEMIC_GENERIC.value,
+                execution_target=ExecutionTarget.SQL_AGENT.value,
+                source="model_classification",
+                confidence=0.58,
+                normalized_message=normalized_message,
+                entities=entities,
+                state=state,
+                full_question=message,
+            )
+            return self._apply_confidence_policy(self._finalize_academic_decision(decision, resolved_user_class, agent))
+
+        if assistant_intent == "OUT_OF_SCOPE":
+            return self._apply_confidence_policy(IntentDecision(
+                intent=IntentLabel.OUT_OF_SCOPE.value,
+                execution_target=ExecutionTarget.OUT_OF_SCOPE.value,
+                source="model_classification",
+                confidence=0.55,
+                normalized_message=normalized_message,
+                entities=entities,
+                state=state,
+            ))
+
         mode = self.groq_service.classify_message_mode(message, history)
         if mode == "ACADEMIC":
             decision = IntentDecision(
@@ -334,10 +426,196 @@ class IntentRouter:
             state=state,
         ))
 
+    def _decision_from_model_analysis(
+        self,
+        analysis: Optional[dict[str, Any]],
+        normalized_message: str,
+        entities: IntentEntities,
+        state: ConversationState,
+        message: str,
+    ) -> Optional[IntentDecision]:
+        if not analysis:
+            return None
+
+        intent_value = str(analysis.get("intent") or "").strip().upper()
+        answer_source = str(analysis.get("answer_source") or "").strip().upper()
+        standalone_query = self._clean_text(analysis.get("standalone_query")) or message
+        if not intent_value or intent_value == "UNKNOWN":
+            return None
+
+        model_class = self._sanitize_model_entity_value(analysis.get("class_name"))
+        model_professor = self._sanitize_model_entity_value(analysis.get("professor_name"))
+        model_room = self._sanitize_model_entity_value(analysis.get("room_name"))
+
+        if model_class:
+            model_class = self._extract_db_class_candidate(model_class) or model_class
+        if model_professor:
+            model_professor = self._resolve_professor_candidate(model_professor) or model_professor
+        if model_room:
+            normalized_room = self._normalize_room_name(model_room)
+            model_room = normalized_room if self._looks_like_valid_room_name(normalized_room) else model_room
+
+        merged_entities = IntentEntities(
+            class_candidate=model_class or entities.class_candidate,
+            professor_candidate=model_professor or entities.professor_candidate,
+            room_candidate=model_room or entities.room_candidate,
+            time_marker=analysis.get("time_hint") or entities.time_marker,
+            day_marker=analysis.get("day_hint") or entities.day_marker,
+            university_topic=analysis.get("university_topic") or entities.university_topic,
+        )
+        confidence = float(analysis.get("confidence", 0.0) or 0.0)
+
+        if merged_entities.class_candidate and not self._looks_like_valid_class_name(merged_entities.class_candidate):
+            merged_entities.class_candidate = entities.class_candidate
+            confidence = min(confidence, 0.55)
+        if merged_entities.room_candidate and not self._looks_like_valid_room_name(merged_entities.room_candidate):
+            merged_entities.room_candidate = entities.room_candidate
+            confidence = min(confidence, 0.55)
+        if merged_entities.professor_candidate and not self._looks_like_valid_professor_name(merged_entities.professor_candidate):
+            merged_entities.professor_candidate = entities.professor_candidate
+            confidence = min(confidence, 0.55)
+        if model_room and not entities.room_candidate and "salle" not in normalized_message:
+            merged_entities.room_candidate = entities.room_candidate
+            confidence = min(confidence, 0.45)
+
+        mapping = {
+            "GREETING": (IntentLabel.CHAT_SMALLTALK.value, ExecutionTarget.SMALLTALK.value),
+            "CLASS_SCHEDULE": (IntentLabel.CLASS_SCHEDULE.value, ExecutionTarget.SQL_AGENT.value),
+            "CLASS_LOCATION": (IntentLabel.CLASS_LOCATION.value, ExecutionTarget.SQL_AGENT.value),
+            "PROF_SCHEDULE": (IntentLabel.PROF_SCHEDULE.value, ExecutionTarget.SQL_AGENT.value),
+            "PROF_LOCATION": (IntentLabel.PROF_LOCATION.value, ExecutionTarget.SQL_AGENT.value),
+            "PROF_CLASS": (IntentLabel.PROF_CLASS.value, ExecutionTarget.SQL_AGENT.value),
+            "PROF_CURRENT_COURSE": (IntentLabel.PROF_CURRENT_COURSE.value, ExecutionTarget.SQL_AGENT.value),
+            "PROF_HAS_COURSE": (IntentLabel.PROF_HAS_COURSE.value, ExecutionTarget.SQL_AGENT.value),
+            "ROOM_CURRENT_TEACHER": (IntentLabel.ROOM_CURRENT_TEACHER.value, ExecutionTarget.SQL_AGENT.value),
+            "ROOM_SCHEDULE": (IntentLabel.ROOM_SCHEDULE.value, ExecutionTarget.SQL_AGENT.value),
+            "AVAILABLE_ROOMS": (IntentLabel.AVAILABLE_ROOMS.value, ExecutionTarget.SQL_AGENT.value),
+            "ENETCOM_INFO": (IntentLabel.UNIVERSITY_INFO.value, ExecutionTarget.UNIVERSITY_SERVICE.value),
+            "CALENDAR": (IntentLabel.CALENDAR.value, ExecutionTarget.SQL_AGENT.value),
+            "ALL_CLASSES": (IntentLabel.ALL_CLASSES.value, ExecutionTarget.SQL_AGENT.value),
+            "OUT_OF_SCOPE": (IntentLabel.OUT_OF_SCOPE.value, ExecutionTarget.OUT_OF_SCOPE.value),
+        }
+        mapped = mapping.get(intent_value)
+        if not mapped:
+            return None
+
+        if answer_source == "UNIVERSITY_SITE":
+            mapped = (IntentLabel.UNIVERSITY_INFO.value, ExecutionTarget.UNIVERSITY_SERVICE.value)
+        elif answer_source == "SMALLTALK":
+            mapped = (IntentLabel.CHAT_SMALLTALK.value, ExecutionTarget.SMALLTALK.value)
+        elif answer_source == "OUT_OF_SCOPE":
+            mapped = (IntentLabel.OUT_OF_SCOPE.value, ExecutionTarget.OUT_OF_SCOPE.value)
+
+        if mapped[0] in {IntentLabel.CHAT_SMALLTALK.value, IntentLabel.OUT_OF_SCOPE.value}:
+            merged_entities = IntentEntities(
+                time_marker=merged_entities.time_marker,
+                day_marker=merged_entities.day_marker,
+            )
+
+        if (
+            normalized_message.startswith("emploi ")
+            and merged_entities.room_candidate
+            and not merged_entities.class_candidate
+            and not merged_entities.professor_candidate
+        ):
+            mapped = (IntentLabel.ROOM_SCHEDULE.value, ExecutionTarget.SQL_AGENT.value)
+            confidence = max(confidence, 0.78)
+
+        if (
+            "je suis" in normalized_message
+            and merged_entities.professor_candidate
+            and any(marker in normalized_message for marker in ("jai cours", "j ai cours", "ai je cours", "est ce jai cours", "est ce que jai cours"))
+        ):
+            mapped = (IntentLabel.PROF_HAS_COURSE.value, ExecutionTarget.SQL_AGENT.value)
+            confidence = max(confidence, 0.82)
+
+        if mapped[0] in {IntentLabel.CLASS_SCHEDULE.value, IntentLabel.CLASS_LOCATION.value}:
+            if merged_entities.professor_candidate and not merged_entities.class_candidate:
+                remap = {
+                    IntentLabel.CLASS_SCHEDULE.value: IntentLabel.PROF_SCHEDULE.value,
+                    IntentLabel.CLASS_LOCATION.value: IntentLabel.PROF_LOCATION.value,
+                }
+                mapped = (remap[mapped[0]], ExecutionTarget.SQL_AGENT.value)
+                confidence = max(confidence, 0.72)
+
+        if mapped[0] in {IntentLabel.ROOM_CURRENT_TEACHER.value, IntentLabel.ROOM_SCHEDULE.value} and not merged_entities.room_candidate:
+            confidence = min(confidence, 0.45)
+
+        if mapped[0] in {
+            IntentLabel.PROF_SCHEDULE.value,
+            IntentLabel.PROF_LOCATION.value,
+            IntentLabel.PROF_CLASS.value,
+            IntentLabel.PROF_CURRENT_COURSE.value,
+            IntentLabel.PROF_HAS_COURSE.value,
+        } and not merged_entities.professor_candidate:
+            confidence = min(confidence, 0.45)
+
+        if mapped[0] in {IntentLabel.CLASS_SCHEDULE.value, IntentLabel.CLASS_LOCATION.value} and not merged_entities.class_candidate:
+            confidence = min(confidence, 0.45)
+
+        return IntentDecision(
+            intent=mapped[0],
+            execution_target=mapped[1],
+            source="model_analysis",
+            confidence=confidence,
+            normalized_message=normalized_message,
+            entities=merged_entities,
+            state=state,
+            full_question=standalone_query if mapped[1] in {ExecutionTarget.SQL_AGENT.value, ExecutionTarget.UNIVERSITY_SERVICE.value} else None,
+        )
+
+    def _sanitize_model_entity_value(self, value: Any) -> Optional[str]:
+        cleaned = self._clean_text(value)
+        if not cleaned:
+            return None
+        normalized = self._normalize_text(cleaned)
+        if not normalized or normalized in self.GENERIC_ENTITY_STOPWORDS:
+            return None
+        return cleaned
+
+    def _looks_like_valid_class_name(self, value: str) -> bool:
+        normalized = self._normalize_text(value)
+        if normalized in self.GENERIC_ENTITY_STOPWORDS:
+            return False
+        if self._extract_db_class_candidate(value):
+            return True
+        compact = self._normalize_class_key(value)
+        return bool(re.search(r"^\d(?:ing|tic|ltic|mp|mr)[a-z0-9-]*\d?$", compact))
+
+    def _looks_like_valid_room_name(self, value: str) -> bool:
+        normalized = self._normalize_room_name(value)
+        return bool(
+            re.fullmatch(r"[A-Z][0-9]{2}", normalized)
+            or re.fullmatch(r"[A-Z]{2,}[0-9]{1,2}", normalized)
+            or "/" in normalized
+        )
+
+    def _looks_like_valid_professor_name(self, value: str) -> bool:
+        normalized = self._normalize_text(value)
+        if normalized in self.GENERIC_ENTITY_STOPWORDS:
+            return False
+        tokens = [token for token in normalized.split() if token not in {"mr", "mme", "m", "monsieur", "madame", "dr"}]
+        if len(tokens) < 2:
+            return False
+        return all(len(token) >= 2 for token in tokens)
+
     def _apply_confidence_policy(self, decision: IntentDecision) -> IntentDecision:
         if decision.execution_target != ExecutionTarget.SQL_AGENT.value:
             return decision
-        threshold = self.MODEL_EXECUTION_CONFIDENCE_THRESHOLD if decision.source == "model_classification" else self.EXECUTION_CONFIDENCE_THRESHOLD
+        threshold = self.MODEL_EXECUTION_CONFIDENCE_THRESHOLD if decision.source in {"model_classification", "model_analysis"} else self.EXECUTION_CONFIDENCE_THRESHOLD
+        if (
+            decision.source == "model_analysis"
+            and decision.full_question
+            and (
+                decision.entities.class_candidate
+                or decision.entities.professor_candidate
+                or decision.entities.room_candidate
+                or decision.entities.university_topic
+                or decision.entities.day_marker
+                or decision.entities.time_marker
+            )
+        ):
+            threshold = min(threshold, 0.5)
         if decision.confidence >= threshold:
             return decision
         decision.execution_target = ExecutionTarget.CLARIFICATION.value
@@ -388,13 +666,16 @@ class IntentRouter:
         state = decision.state
         entities = decision.entities
         base_question = decision.full_question or ""
-        full_question = self._augment_question(
-            base_question,
-            decision.intent,
-            entities,
-            state,
-            user_class,
-        )
+        if decision.source == "model_analysis" and base_question:
+            full_question = base_question
+        else:
+            full_question = self._augment_question(
+                base_question,
+                decision.intent,
+                entities,
+                state,
+                user_class,
+            )
 
         if decision.intent in {IntentLabel.CLASS_SCHEDULE.value, IntentLabel.CLASS_LOCATION.value}:
             class_value = entities.class_candidate or user_class or state.last_class
@@ -475,6 +756,14 @@ class IntentRouter:
                 if intent == IntentLabel.PROF_HAS_COURSE.value:
                     return f"{professor_value} a cours{day_suffix or ' aujourd hui'}"
 
+        if intent in {IntentLabel.ROOM_SCHEDULE.value, IntentLabel.ROOM_CURRENT_TEACHER.value}:
+            room_value = entities.room_candidate
+            if room_value:
+                day_suffix = self._day_suffix_from_entities(entities)
+                if intent == IntentLabel.ROOM_SCHEDULE.value:
+                    return f"emploi du temps de salle {room_value}{day_suffix}"
+                return f"qui enseigne maintenant en salle {room_value}"
+
         return message
 
     def _resolve_pending_request(
@@ -517,12 +806,27 @@ class IntentRouter:
             )
 
         selected_professor = self._extract_confirmed_professor(message, state.pending_assistant_message)
-        full_question = self._replace_professor_in_question(state.pending_original_question, selected_professor or message)
-        intent = self._infer_academic_intent(
-            full_question,
-            self._normalize_text(full_question),
-            self._extract_entities(full_question),
-        ) or IntentLabel.PROF_SCHEDULE.value
+        target_professor = selected_professor or message
+        if state.pending_intent in {
+            IntentLabel.PROF_SCHEDULE.value,
+            IntentLabel.PROF_LOCATION.value,
+            IntentLabel.PROF_CLASS.value,
+            IntentLabel.PROF_CURRENT_COURSE.value,
+            IntentLabel.PROF_HAS_COURSE.value,
+        }:
+            full_question = self._question_from_professor_and_intent(
+                state.pending_original_question,
+                state.pending_intent,
+                target_professor,
+            )
+            intent = state.pending_intent
+        else:
+            full_question = self._replace_professor_in_question(state.pending_original_question, target_professor)
+            intent = self._infer_academic_intent(
+                full_question,
+                self._normalize_text(full_question),
+                self._extract_entities(full_question),
+            ) or IntentLabel.PROF_SCHEDULE.value
         return IntentDecision(
             intent=intent,
             execution_target=ExecutionTarget.SQL_AGENT.value,
@@ -591,6 +895,7 @@ class IntentRouter:
             state.pending_slot = pending[0]
             state.pending_original_question = pending[1]
             state.pending_assistant_message = pending[2]
+            state.pending_intent = pending[3]
 
         for message in reversed(history or []):
             role, content = self._history_message_parts(message)
@@ -923,13 +1228,15 @@ class IntentRouter:
         normalized = self._normalize_text(message)
         if not normalized or normalized in self.YES_MARKERS or normalized in self.NO_MARKERS:
             return False
+        if normalized.startswith("emploi") or normalized.startswith("edt") or normalized.startswith("planning"):
+            return True
         return bool(
             self._infer_academic_intent(message, normalized, entities)
             or self._is_direct_university_question(normalized)
             or self._is_calendar_question(normalized)
         )
 
-    def _extract_pending_request(self, history: list) -> Optional[tuple[str, str, str]]:
+    def _extract_pending_request(self, history: list) -> Optional[tuple[str, str, str, Optional[str]]]:
         if not history or len(history) < 2:
             return None
 
@@ -953,13 +1260,27 @@ class IntentRouter:
             if any(trigger in lowered for trigger in class_triggers):
                 prev_role, prev_content = self._history_message_parts(history[i - 1]) if i > 0 else ("", "")
                 if prev_role == "user":
-                    return (PendingSlot.CLASS.value, prev_content, content)
+                    inferred_intent = self._infer_pending_intent(prev_content)
+                    return (PendingSlot.CLASS.value, prev_content, content, inferred_intent)
                 break
             if any(trigger in lowered for trigger in professor_triggers):
                 prev_role, prev_content = self._history_message_parts(history[i - 1]) if i > 0 else ("", "")
                 if prev_role == "user":
-                    return (PendingSlot.PROFESSOR.value, prev_content, content)
+                    inferred_intent = self._infer_pending_intent(prev_content)
+                    return (PendingSlot.PROFESSOR.value, prev_content, content, inferred_intent)
                 break
+        return None
+
+    def _infer_pending_intent(self, message: str) -> Optional[str]:
+        normalized = self._normalize_text(message)
+        entities = self._extract_entities(message)
+        inferred = self._infer_academic_intent(message, normalized, entities)
+        if inferred:
+            return inferred
+        if entities.professor_candidate and any(
+            marker in normalized for marker in ("quelle classe", "quel classe", "classe existe", "classe se trouve")
+        ):
+            return IntentLabel.PROF_CLASS.value
         return None
 
     def _extract_confirmed_professor(self, message: str, assistant_message: str) -> Optional[str]:
@@ -1011,6 +1332,28 @@ class IntentRouter:
             return re.sub(re.escape(existing_prof), professor_name, original_question, count=1, flags=re.IGNORECASE)
         return f"{original_question} pour le professeur {professor_name}"
 
+    def _question_from_professor_and_intent(self, original_question: str, intent: str, professor_name: str) -> str:
+        normalized = self._normalize_text(original_question or "")
+        day_suffix = ""
+        if "demain" in normalized:
+            day_suffix = " demain"
+        elif "aujourd" in normalized:
+            day_suffix = " aujourd'hui"
+        elif "hier" in normalized:
+            day_suffix = " hier"
+
+        if intent == IntentLabel.PROF_SCHEDULE.value:
+            return f"emploi du temps de {professor_name}{day_suffix}"
+        if intent == IntentLabel.PROF_LOCATION.value:
+            return f"ou se trouve {professor_name}{day_suffix}"
+        if intent == IntentLabel.PROF_CLASS.value:
+            return f"dans quelle classe se trouve {professor_name}{day_suffix}"
+        if intent == IntentLabel.PROF_CURRENT_COURSE.value:
+            return f"quel cours fait {professor_name}{day_suffix or ' maintenant'}"
+        if intent == IntentLabel.PROF_HAS_COURSE.value:
+            return f"{professor_name} a cours{day_suffix or ' aujourd hui'}"
+        return self._replace_professor_in_question(original_question, professor_name)
+
     def _extract_professor_candidate(self, message: str) -> Optional[str]:
         q = self._clean_text(message)
         if not q or self._extract_class_candidate(q):
@@ -1032,6 +1375,22 @@ class IntentRouter:
         if title_match:
             candidate = strip_trailing_time_words(title_match.group(2).strip())
             return self._resolve_professor_candidate(candidate)
+
+        self_identification_match = re.search(
+            r"\bje\s+suis\s+([A-Za-z'\-]+(?:\s+[A-Za-z'\-]+){0,2})",
+            q,
+            re.IGNORECASE,
+        )
+        if self_identification_match:
+            candidate = re.split(
+                r"\b(est ce|est-ce|jai|j ai|ai je|demain|aujourd|maintenant)\b",
+                self_identification_match.group(1).strip(),
+                maxsplit=1,
+                flags=re.IGNORECASE,
+            )[0].strip()
+            resolved = self._resolve_professor_candidate(strip_trailing_time_words(candidate))
+            if resolved:
+                return resolved
 
         schedule_match = re.search(
             r"\bemploi(?:s)?\s+(?:du|de)\s+temps+\s+de\s+([A-Za-zÀ-ÿ'\-]+(?:\s+[A-Za-zÀ-ÿ'\-]+){0,2})\s*$",
@@ -1063,6 +1422,8 @@ class IntentRouter:
         question_text = message or ""
         patterns = [
             r"\bsalle\s+([A-Za-z0-9][A-Za-z0-9\- ]*)\b",
+            r"\bemploi\s+([A-Za-z]{1,6}\s*0?\d{1,2})\b",
+            r"\bemploi\s+de\s+([A-Za-z]{1,6}\s*0?\d{1,2})\b",
             r"\bemploi(?:s)?\s+(?:du|de)\s+temps\s+de\s+([A-Za-z]{1,6}\s*0?\d{1,2})\b",
         ]
         for pattern in patterns:
@@ -1151,6 +1512,8 @@ class IntentRouter:
             if len(tokens) >= 2:
                 alias_candidates.add(" ".join(list(reversed(tokens))))
                 alias_candidates.add("".join(reversed(tokens)))
+                alias_candidates.add(" ".join([tokens[-1]] + tokens[:-1]))
+                alias_candidates.add("".join([tokens[-1]] + tokens[:-1]))
 
             for token in {tokens[0], tokens[-1]}:
                 if len(token) >= 3:
