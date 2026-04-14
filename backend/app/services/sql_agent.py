@@ -3064,6 +3064,7 @@ class SQLAgent:
         q = (question or "").strip()
         if self._is_schedule_intent(q) and self._extract_class_candidate(q):
             return None
+        name_pattern = r"[A-Za-zÀ-ÖØ-öø-ÿ'\-]"
 
         def _strip_trailing_time_words(value: str) -> str:
             return re.sub(
@@ -3074,7 +3075,7 @@ class SQLAgent:
             ).strip()
 
         match = re.search(
-            r"\b(mr|mme|m\.|monsieur|madame)\s+([A-Za-zÃ€-Ã¿'\-]+(?:\s+[A-Za-zÃ€-Ã¿'\-]+){1,3})\b",
+            rf"\b(mr|mme|m\.|monsieur|madame)\s+(({name_pattern}+(?:\s+{name_pattern}+){1,3}))\b",
             q,
             re.IGNORECASE,
         )
@@ -3083,7 +3084,7 @@ class SQLAgent:
             return candidate if self._is_valid_prof_candidate_text(candidate) else None
 
         match = re.search(
-            r"\bde\s+([A-Za-zÃ€-Ã¿'\-]+(?:\s+[A-Za-zÃ€-Ã¿'\-]+){1,3})\b",
+            rf"\bde\s+({name_pattern}+(?:\s+{name_pattern}+){1,3})\b",
             q,
             re.IGNORECASE,
         )
@@ -3091,14 +3092,14 @@ class SQLAgent:
             candidate = _strip_trailing_time_words(match.group(1).strip())
         else:
             fallback_match = re.search(
-                r"(?:dans quelle classe se trouve|ou se trouve|pour quelle classe|quelle classe pour)\s+([A-Za-zÃ€-Ã¿'\-]+(?:\s+[A-Za-zÃ€-Ã¿'\-]+){0,3})$",
+                rf"(?:dans quelle classe se trouve|ou se trouve|pour quelle classe|quelle classe pour)\s+({name_pattern}+(?:\s+{name_pattern}+){0,3})$",
                 q,
                 re.IGNORECASE,
             )
             if fallback_match:
                 candidate = _strip_trailing_time_words(fallback_match.group(1).strip())
             else:
-                bare_match = re.fullmatch(r"\s*([A-Za-zÃ€-Ã¿'\-]+(?:\s+[A-Za-zÃ€-Ã¿'\-]+){1,3})\s*", q)
+                bare_match = re.fullmatch(rf"\s*({name_pattern}+(?:\s+{name_pattern}+){1,3})\s*", q)
                 if not bare_match or self._extract_class_candidate(q):
                     return None
                 candidate = _strip_trailing_time_words(bare_match.group(1).strip())
@@ -3114,9 +3115,10 @@ class SQLAgent:
             return prof
         if not self._is_schedule_intent(question) or self._extract_class_candidate(question) or self._extract_room_candidate(question):
             return None
+        name_pattern = r"[A-Za-zÀ-ÖØ-öø-ÿ'\-]"
 
         match = re.search(
-            r"\bemploi(?:s)?\s+(?:du|de)\s+temps+\s+de\s+([A-Za-zÃ€-Ã¿'\-]+(?:\s+[A-Za-zÃ€-Ã¿'\-]+){1,3})\s*$",
+            rf"\bemploi(?:s)?\s+(?:du|de)\s+temps+\s+de\s+({name_pattern}+(?:\s+{name_pattern}+){1,3})\s*$",
             question or "",
             re.IGNORECASE,
         )
