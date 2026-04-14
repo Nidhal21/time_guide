@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import text
 
 from .groq_service import groq_service
+from .intent_router import IntentLabel
 from .university_info_service import university_info_service
 
 
@@ -162,6 +163,9 @@ class SQLAgent:
             "disponnible": "disponible",
             "feriee": "ferie",
             "feries": "ferie",
+            "ferier": "ferie",
+            "prochien": "prochain",
+            "tempss": "temps",
             "lemploi": "emploi",
             "l emploi": "emploi",
             "ou ce trouve": "ou se trouve",
@@ -857,11 +861,26 @@ class SQLAgent:
                 "donner toutes les classes",
                 "liste des classes",
                 "quelles classes existent",
+                "quels sont les classes existes",
                 "classes disponibles",
+                "combien de classe",
+                "combien de classes",
+                "nombre de classes",
             ]
         ) and "ma classe" not in q
 
-    def _all_classes_sql(self) -> Tuple[str, Dict[str, Any]]:
+    def _is_class_count_request(self, question: str) -> bool:
+        q = self._normalize_text(question)
+        return any(marker in q for marker in ["combien de classe", "combien de classes", "nombre de classes"])
+
+    def _all_classes_sql(self, question: str = "") -> Tuple[str, Dict[str, Any]]:
+        if self._is_class_count_request(question):
+            sql = """
+            SELECT COUNT(DISTINCT c.nom) AS total_classes
+            FROM classes c;
+            """
+            return sql, {}
+
         sql = """
         SELECT DISTINCT c.nom AS classe
         FROM classes c
@@ -873,7 +892,21 @@ class SQLAgent:
         q = self._normalize_text(question)
         if not q:
             return False
-        if any(marker in q for marker in ["plan d etude", "plans d etude", "plan des etudes", "plans des etudes", "programme des etudes"]):
+        if any(marker in q for marker in [
+            "plan d etude",
+            "plan etude ",
+            "plan de etude",
+            "plan detude",  
+            "plan "
+            "plan etude",
+            "plans d etude",
+            "plans de etude",
+            "plans etudes",
+            "plan des etudes",
+            "plans des etudes",
+            "programme etude",
+            "programme des etudes",
+        ]):
             return True
         if self._is_calendar_question(question):
             return False
@@ -2193,13 +2226,13 @@ class SQLAgent:
             return None
 
         match = re.search(
-            r"\bemploi(?:s)?\s+(?:du|de)\s+temps\s+de\s+([A-Za-zÀ-ÿ'\-]+(?:\s+[A-Za-zÀ-ÿ'\-]+){1,2})\s*$",
+            r"\bemploi(?:s)?\s+(?:du|de)\s+temps+\s+de\s+([A-Za-zÀ-ÿ'\-]+(?:\s+[A-Za-zÀ-ÿ'\-]+){1,2})\s*$",
             question or "",
             re.IGNORECASE,
         )
         if not match:
             single_word_match = re.search(
-                r"\bemploi(?:s)?\s+(?:du|de)\s+temps\s+de\s+([A-Za-z'\-]+)\s*$",
+                r"\bemploi(?:s)?\s+(?:du|de)\s+temps+\s+de\s+([A-Za-z'\-]+)\s*$",
                 question or "",
                 re.IGNORECASE,
             )
@@ -2524,6 +2557,10 @@ class SQLAgent:
             "ramadan",
             "examen",
             "examens",
+            "devoir",
+            "devoirs",
+            "controle",
+            "controles",
             "ds",
             "rattrap",
             "ratt",
@@ -2564,7 +2601,7 @@ class SQLAgent:
             return "jour_ferie"
         if "revision" in q:
             return "revision"
-        if any(marker in q for marker in ["examen", "ds", "ratt"]):
+        if any(marker in q for marker in ["examen", "ds", "ratt", "devoir", "controle"]):
             return "examen"
         if "periode" in q:
             return "periode"
@@ -2782,7 +2819,7 @@ class SQLAgent:
 
         return None
 
-    def _exec_and_format_v2(self, question: str, sql_query: str, params: Dict[str, Any], context: dict) -> str:
+    def _exec_and_format_v2(self, question: str, sql_query: str, params: Dict[str, Any], context: dict, use_llm_formatter: bool = True) -> str:
         try:
             print(f"SQL execute: {sql_query}")
             result = self.db.execute(text(sql_query), params or {})
@@ -2793,7 +2830,7 @@ class SQLAgent:
                 return self._format_empty_response(question, context) or "Aucune donnee trouvee pour cette question."
 
             data = [dict(row._mapping) for row in rows]
-            formatted = groq_service.format_response(question, data, context)
+            formatted = groq_service.format_response(question, data, context, use_llm=use_llm_formatter)
             return formatted or "Resultats trouves, mais impossible de formater la reponse."
         except Exception as e:
             print(f"Erreur SQL: {e}")
@@ -2862,6 +2899,157 @@ class SQLAgent:
 
         return None
 
+    def _build_routed_sql(self, intent: str, question: str, context: dict) -> tuple[Optional[str], Dict[str, Any], Optional[str]]:
+        if intent == IntentLabel.CALENDAR.value:
+            sql_query, params = self._calendar_sql(question, context)
+            return sql_query, params, None
+
+        if intent == IntentLabel.ALL_CLASSES.value:
+            sql_query, params = self._all_classes_sql(question)
+            return sql_query, params, None
+
+        if intent == IntentLabel.ROOM_CURRENT_TEACHER.value:
+            sql_query, params = self._room_current_teacher_sql(question, context)
+            return sql_query, params, None
+
+        if intent == IntentLabel.ROOM_SCHEDULE.value:
+            room_name = self._extract_room_candidate(question) or ""
+            if room_name and not self._room_exists_in_db(room_name):
+                return None, {}, self._room_not_found_message(room_name)
+            sql_query, params = self._room_schedule_sql(question, context)
+            return sql_query, params, None
+
+        if intent == IntentLabel.AVAILABLE_ROOMS.value:
+            if self._question_mentions_now(question):
+                sql_query, params = self._available_rooms_now_sql(context)
+            else:
+                sql_query, params = self._available_rooms_day_sql(question, context)
+            return sql_query, params, None
+
+        if intent == IntentLabel.CLASS_LOCATION.value:
+            cls = self._extract_class_candidate(question) or ""
+            cls = self._normalize_class_aliases(cls, context)
+            if context.get("semestre_id") and cls and not self._class_exists_in_db(cls, context):
+                return None, {}, (
+                    f"Je ne trouve pas la classe '{cls}' dans le semestre actuel ({context.get('semestre','?')}). "
+                    "Verifiez le nom (ex: '1 TIC 2') ou precisez le semestre (S1/S2)."
+                )
+            sql_query, params = self._class_location_sql(question, context)
+            return sql_query, params, None
+
+        if intent == IntentLabel.CLASS_SCHEDULE.value:
+            cls = self._extract_class_candidate(question) or ""
+            cls = self._normalize_class_aliases(cls, context)
+            if context.get("semestre_id") and cls and not self._class_exists_in_db(cls, context):
+                return None, {}, (
+                    f"Je ne trouve pas la classe '{cls}' dans le semestre actuel ({context.get('semestre','?')}). "
+                    "Verifiez le nom (ex: '1 TIC 2') ou precisez le semestre (S1/S2)."
+                )
+            sql_query, params = self._class_schedule_sql(question, context)
+            return sql_query, params, None
+
+        if intent == IntentLabel.PROF_CLASS.value:
+            prof = self._extract_prof_candidate(question)
+            if prof and not self._prof_exists_in_db(prof):
+                return None, {}, self._prof_not_found_message(prof)
+            sql_query, params = self._prof_class_sql(question, context)
+            return sql_query, params, None
+
+        if intent == IntentLabel.PROF_LOCATION.value:
+            prof = self._extract_prof_candidate(question)
+            if prof and not self._prof_exists_in_db(prof):
+                return None, {}, self._prof_not_found_message(prof)
+            sql_query, params = self._prof_location_sql(question, context)
+            return sql_query, params, None
+
+        if intent == IntentLabel.PROF_CURRENT_COURSE.value:
+            prof = self._extract_prof_candidate(question)
+            if prof and not self._prof_exists_in_db(prof):
+                return None, {}, self._prof_not_found_message(prof)
+            sql_query, params = self._prof_current_course_sql(question, context)
+            return sql_query, params, None
+
+        if intent == IntentLabel.PROF_HAS_COURSE.value:
+            prof = self._extract_prof_candidate(question)
+            if prof and not self._prof_exists_in_db(prof):
+                return None, {}, self._prof_not_found_message(prof)
+            sql_query, params = self._prof_has_course_sql(question, context)
+            return sql_query, params, None
+
+        if intent == IntentLabel.PROF_SCHEDULE.value:
+            prof = self._extract_schedule_prof_candidate(question) or self._extract_prof_candidate(question)
+            if prof and not self._prof_exists_in_db(prof):
+                return None, {}, self._prof_not_found_message(prof)
+            sql_query, params = self._teacher_prof_schedule_sql(question, context) if self._teacher_prof_exists_in_db(prof or "") else ("", {})
+            return sql_query, params, None
+
+        return None, {}, None
+
+    def process_routed_question(self, intent: str, question: str, confidence: float = 1.0) -> str:
+        question = self._keep_last_user_message(question)
+        print(f"\n=== Question routée reçue: {question} ({intent}, confidence={confidence}) ===")
+
+        context = get_current_academic_context(self.db)
+        base = self._context_date(context)
+        context["jour_actuel"] = DAY_MAP_ISO[base.isoweekday()]
+        print(f"Contexte académique: {context}")
+
+        if intent == IntentLabel.UNIVERSITY_INFO.value:
+            return university_info_service.answer_question(question)
+
+        sql_query, params, early_response = self._build_routed_sql(intent, question, context)
+        if early_response:
+            return early_response
+        if sql_query:
+            return self._exec_and_format_v2(question, sql_query, params, context, use_llm_formatter=False)
+
+        if intent != IntentLabel.ACADEMIC_GENERIC.value:
+            return self.process_question(question)
+
+        cls = self._extract_class_candidate(question)
+        if cls:
+            cls2 = self._normalize_class_aliases(cls, context)
+            if cls2 != cls:
+                question = re.sub(re.escape(cls), cls2, question, flags=re.IGNORECASE)
+
+        if confidence < 0.65:
+            return (
+                "Je ne suis pas encore assez sur de votre demande academique. "
+                "Pouvez-vous reformuler en precisant la classe, le professeur, la salle ou l'information voulue ?"
+            )
+
+        if not (groq_service and getattr(groq_service, "enabled", False)):
+            return "Groq API n'est pas active (GROQ_API_KEY manquant). Impossible de generer la requete SQL."
+
+        sql_query = groq_service.generate_sql(question, context, SCHEMA_INFO)
+        if not sql_query:
+            return "Groq n'a pas pu generer une requete SQL."
+
+        if sql_query == "ASK_CLASS":
+            return "Quelle est votre classe ?"
+        if sql_query == "ASK_PROF":
+            return "Quel professeur cherchez-vous ?"
+
+        sql_query = (sql_query or "").replace("```sql", "").replace("```", "").strip()
+        if not self._validate_select_only(sql_query):
+            return "Requete SQL invalide (seulement SELECT autorise)."
+
+        sql_query = self._repair_sql(sql_query)
+        sql_query = self._ensure_active_version_filter(sql_query)
+        sql_query = self._enforce_current_periode_default(question, sql_query, context)
+        sql_query = self._enforce_periode_marker(question, sql_query, context)
+        sql_query = self._enforce_professor_matching(question, sql_query)
+
+        if self._question_mentions_day(question):
+            sql_query = self._enforce_requested_day_filter(question, sql_query, context)
+
+        if self._is_schedule_intent(question) and (
+            not self._question_mentions_day(question) or self._is_full_schedule_request(question)
+        ):
+            sql_query = self._strip_day_filter(sql_query)
+
+        return self._exec_and_format_v2(question, sql_query, {}, context, use_llm_formatter=False)
+
     # ---------------------------------------------------------------------
     # Public API
     # ---------------------------------------------------------------------
@@ -2880,7 +3068,7 @@ class SQLAgent:
             return self._exec_and_format(question, sql_query, params, context)
 
         if self._is_all_classes_request(question):
-            sql_query, params = self._all_classes_sql()
+            sql_query, params = self._all_classes_sql(question)
             return self._exec_and_format(question, sql_query, params, context)
 
         if self._is_room_current_teacher_question(question):

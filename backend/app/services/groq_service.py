@@ -22,6 +22,7 @@ CONVERSATION_MARKERS = (
     "bonjour",
     "bonsoir",
     "salut",
+    "slt",
     "coucou",
     "hello",
     "hi",
@@ -163,6 +164,23 @@ class GroqService:
             normalized = re.sub(rf"\b{re.escape(source)}\b", target, normalized)
         return normalized
 
+    def _collapse_repeated_letters(self, value: str) -> str:
+        return re.sub(r"([a-z])\1{1,}", r"\1", value or "")
+
+    def _conversation_normalize(self, text: str) -> str:
+        q = self._normalize_text(text)
+        tokens = [self._collapse_repeated_letters(token) for token in q.split()]
+        return " ".join(tokens).strip()
+
+    def _contains_marker(self, normalized_text: str, markers: tuple[str, ...]) -> bool:
+        normalized_markers = [self._conversation_normalize(marker) for marker in markers]
+        return any(
+            marker == normalized_text
+            or normalized_text.startswith(f"{marker} ")
+            or f" {marker} " in f" {normalized_text} "
+            for marker in normalized_markers
+        )
+
     def _history_as_text(self, history: Optional[list], limit: int = 4) -> str:
         if not history:
             return ""
@@ -199,21 +217,28 @@ class GroqService:
             return True
         return False
 
+    def is_obvious_academic_request(self, message: str) -> bool:
+        return self._is_obvious_academic_request(message)
+
     def _is_simple_conversation(self, message: str) -> bool:
-        q = self._normalize_text(message)
+        q = self._conversation_normalize(message)
         if not q:
             return True
 
         compact = q.replace(" ", "")
-        if compact in {"cv", "cava"}:
+        tokens = q.split()
+        if compact in {"cv", "cava"} or "cv" in tokens or "cava" in tokens:
             return True
-        if any(marker == q or q.startswith(f"{marker} ") or f" {marker} " in f" {q} " for marker in CONVERSATION_MARKERS):
+        if self._contains_marker(q, CONVERSATION_MARKERS):
             return True
-        if any(marker in q for marker in THANKS_MARKERS):
+        if self._contains_marker(q, THANKS_MARKERS):
             return True
-        if any(marker in q for marker in HELP_MARKERS):
+        if self._contains_marker(q, HELP_MARKERS):
             return True
         return False
+
+    def is_simple_conversation(self, message: str) -> bool:
+        return self._is_simple_conversation(message)
 
     def _classify_message_mode(self, message: str, history: Optional[list] = None) -> Optional[str]:
         if not self.enabled:
@@ -234,8 +259,6 @@ Examples:
 - "merci beaucoup" -> NON_ACADEMIC
 - "tu peux m'aider ?" -> NON_ACADEMIC
 - "j'ai quoi demain" -> ACADEMIC
-- "chnia andi ghedwa" -> ACADEMIC
-- "win nalka salle libre tawa" -> ACADEMIC
 - "ou est mr ben amor" -> ACADEMIC
 - "salle libre maintenant" -> ACADEMIC
 - "quelles sont les actualites" -> ACADEMIC
@@ -279,27 +302,40 @@ Last user message:
             return "NON_ACADEMIC"
         return None
 
+    def classify_message_mode(self, message: str, history: Optional[list] = None) -> Optional[str]:
+        return self._classify_message_mode(message, history)
+
     def _fallback_conversational_response(self, message: str, user_class: Optional[str] = None) -> str:
-        q = self._normalize_text(message)
+        q = self._conversation_normalize(message)
         class_hint = f" Votre classe actuelle est {user_class}." if user_class else ""
+        greeting_detected = self._contains_marker(q, CONVERSATION_MARKERS)
+        thanks_detected = self._contains_marker(q, THANKS_MARKERS)
+        help_detected = self._contains_marker(q, HELP_MARKERS)
+        tokens = q.split()
+        status_detected = "ca va" in q or q.replace(" ", "") in {"cv", "cava"} or "cv" in tokens or "cava" in tokens
 
         if not q:
-            return "Je suis la pour vous aider. Posez-moi une question sur votre emploi du temps, une salle, un professeur ou ENET'Com."
-        if any(marker in q for marker in THANKS_MARKERS):
-            return "Avec plaisir. Si vous voulez, je peux aussi vous aider pour l'emploi du temps, les salles, les professeurs ou les infos ENET'Com."
-        if any(marker in q for marker in HELP_MARKERS):
+            return "Bonjour. Je peux vous aider avec l'emploi du temps, les salles, les professeurs, les absences et les informations ENET'Com."
+        if thanks_detected:
+            return "Avec plaisir. Si vous voulez, dites-moi votre classe, une salle, un professeur ou une information ENET'Com."
+        if help_detected:
             return (
                 "Je peux vous aider avec l'emploi du temps, les cours du jour, les salles disponibles, les professeurs, "
-                "le calendrier universitaire et les informations ENET'Com." + class_hint
+                "les absences, le calendrier universitaire et les informations ENET'Com." + class_hint
             )
-        if "ca va" in q or q.replace(" ", "") in {"cv", "cava"}:
-            return "Ca va bien, merci. Je peux vous aider avec votre emploi du temps, les salles, les professeurs ou les infos ENET'Com."
-        if any(marker == q or q.startswith(f"{marker} ") for marker in CONVERSATION_MARKERS):
-            return "Bonjour. Je peux vous aider pour l'emploi du temps, les salles, les professeurs et les informations ENET'Com."
+        if greeting_detected and status_detected:
+            return "Bonjour. Je vais bien, merci. Je peux vous aider avec l'emploi du temps, les salles, les professeurs, les absences et les informations ENET'Com."
+        if status_detected:
+            return "Je vais bien, merci. Je peux vous aider avec l'emploi du temps, les salles, les professeurs, les absences et les informations ENET'Com."
+        if greeting_detected:
+            return "Bonjour. Je peux vous aider avec l'emploi du temps, les salles, les professeurs, les absences et les informations ENET'Com."
         return (
             "Je suis la pour vous aider. Dites-moi ce que vous cherchez, par exemple votre emploi du temps, une salle libre, "
             "un professeur ou une information sur ENET'Com."
         )
+
+    def build_smalltalk_response(self, message: str, user_class: Optional[str] = None) -> str:
+        return self._fallback_conversational_response(message, user_class)
 
     def _fallback_out_of_scope_response(self, message: str) -> str:
         q = self._normalize_text(message)
@@ -309,6 +345,63 @@ Last user message:
                 "les absences, le calendrier universitaire et les informations de l'ecole."
             )
         return "Je suis surtout l'assistant ENET'Com. Posez-moi une question sur l'emploi du temps, les salles, les professeurs ou les services de l'ecole."
+
+    def build_out_of_scope_response(
+        self,
+        message: str,
+        history: Optional[list] = None,
+        user_class: Optional[str] = None,
+    ) -> str:
+        if not self.enabled:
+            return self._fallback_out_of_scope_response(message)
+
+        history_text = self._history_as_text(history)
+        prompt = f"""Tu es un assistant intelligent pour ENET'Com.
+
+Le message de l'utilisateur n'entre pas clairement dans le perimetre ENET'Com.
+Reponds naturellement et de facon utile, sans t'appuyer sur l'historique pour inventer une reponse hors sujet.
+
+Consignes:
+- Explique poliment si la demande est hors perimetre.
+- Si la demande est vague, aide-le a formuler une question utile.
+- Tu peux proposer tes capacites: emploi du temps, cours, professeurs, salles, absences, calendrier universitaire, informations ENET'Com.
+- N'evoque pas inutilement les anciens messages, la classe ou un contexte precedent si cela n'aide pas la reponse.
+- Reste bref, chaleureux, sans markdown.
+
+Classe connue: {user_class or "inconnue"}
+Historique recent:
+{history_text or "Aucun"}
+
+Dernier message utilisateur:
+{message}
+"""
+
+        response = self._post_with_retry(
+            {
+                "model": self.model,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": "Tu es un assistant conversationnel ENET'Com. Quand une demande est hors perimetre, dis-le poliment et recentre vers les sujets ENET'Com.",
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                "temperature": 0.3,
+                "max_tokens": 220,
+            },
+            timeout=20,
+        )
+        if response is None or response.status_code != 200:
+            if response is not None:
+                print(f"Groq conversation error: {response.status_code} - {response.text}")
+            return self._fallback_out_of_scope_response(message)
+
+        payload = self._safe_json(response)
+        if not payload:
+            return self._fallback_out_of_scope_response(message)
+
+        raw = (payload.get("choices", [{}])[0].get("message", {}).get("content", "") or "").strip()
+        return self._postprocess_response(raw) if raw else self._fallback_out_of_scope_response(message)
 
     def maybe_answer_conversational_message(
         self,
@@ -538,6 +631,21 @@ Dernier message utilisateur:
                 if day_label and day_label not in {"aujourd'hui", "demain", "hier"}:
                     return f"Oui, ce professeur a {total} cours {day_label}."
                 return f"Oui, ce professeur a {total} cours prevus."
+
+            if key.lower() == "total_classes":
+                try:
+                    total = int(values[0])
+                except Exception:
+                    return None
+                return f"ENET'Com compte {total} classes dans la base de donnees."
+
+            if key.lower() == "classe":
+                if any(marker in q for marker in ["quelles classes", "liste des classes", "classes existent", "classes disponibles"]):
+                    lines = ["Voici les classes disponibles a ENET'Com :"]
+                    lines.extend(f"- {value}" for value in values[:80])
+                    if len(values) > 80:
+                        lines.append(f"... et {len(values) - 80} autres classes.")
+                    return "\n".join(lines)
 
             if key.lower() in {"nom", "room", "salle"}:
                 if any(token in q for token in ["dispon", "libre", "vide"]):
@@ -861,7 +969,7 @@ SQL:"""
 
     # --- Response formatting ---
 
-    def format_response(self, question: str, data: list, context: dict) -> Optional[str]:
+    def format_response(self, question: str, data: list, context: dict, use_llm: bool = True) -> Optional[str]:
         if not data:
             return "Aucune donnee trouvee pour cette question."
 
@@ -882,6 +990,9 @@ SQL:"""
         timetable_response = self._format_timetable_response(data)
         if timetable_response:
             return timetable_response
+
+        if not use_llm:
+            return None
 
         if not self.enabled:
             return None
@@ -923,6 +1034,9 @@ Return plain French text with line breaks and no markdown."""
 
         raw = (payload.get("choices", [{}])[0].get("message", {}).get("content", "") or "").strip()
         return self._postprocess_response(raw)
+
+    def format_response_deterministic(self, question: str, data: list, context: dict) -> Optional[str]:
+        return self.format_response(question, data, context, use_llm=False)
 
     def _postprocess_response(self, text: str) -> str:
         if not text:

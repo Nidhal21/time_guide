@@ -161,8 +161,22 @@ class SQLAgentWeekdayTests(unittest.TestCase):
         self.agent._prof_exists_in_db = lambda name: name == "SMAOUI Ikram"
         self.assertTrue(self.agent._is_prof_schedule_question("emploi de temps de SMAOUI Ikram"))
 
+    def test_detects_professor_schedule_question_with_typo_on_temps(self):
+        self.assertEqual(
+            self.agent._extract_schedule_prof_candidate("emploi de tempss de ali khalfeoui"),
+            "ali khalfeoui",
+        )
+
     def test_detects_professor_schedule_question_with_single_name(self):
         self.assertTrue(self.agent._is_prof_schedule_question("emploi de temps de soulef"))
+
+    def test_university_general_question_accepts_plan_etude_without_preposition(self):
+        self.assertTrue(self.agent._is_university_general_question("plan etude gii"))
+
+    def test_all_classes_request_supports_count_wording(self):
+        self.assertTrue(self.agent._is_all_classes_request("combien de classe dans enetcom"))
+        sql, _ = self.agent._all_classes_sql("combien de classe dans enetcom")
+        self.assertIn("COUNT(DISTINCT c.nom)", sql)
 
     def test_prof_not_found_message_lists_similar_names(self):
         self.agent._find_similar_professors = lambda name: ["ALI KHLFALLAH", "ALI KHALFEDIN"]

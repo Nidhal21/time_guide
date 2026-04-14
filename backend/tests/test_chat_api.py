@@ -34,7 +34,7 @@ class ChatApiWeekdaySmokeTests(unittest.TestCase):
             with patch.object(groq_service, "generate_sql", return_value=sql), patch.object(
                 groq_service,
                 "format_response",
-                side_effect=lambda question, data, context: f"{len(data)} lignes pour {data[0]['jour']}",
+                side_effect=lambda question, data, context, **kwargs: f"{len(data)} lignes pour {data[0]['jour']}",
             ):
                 response = self.client.post(
                     "/api/chat",
@@ -183,7 +183,7 @@ class ChatApiWeekdaySmokeTests(unittest.TestCase):
             {"role": "user", "content": "emploi de temps de 2gec3"},
             {"role": "assistant", "content": "Quelle est votre classe ?"},
         ]
-        with patch("app.routes.chat.SQLAgent.process_question", side_effect=lambda question: question):
+        with patch("app.routes.chat.SQLAgent.process_routed_question", side_effect=lambda intent, question, confidence=1.0: question):
             response = self.client.post(
                 "/api/chat",
                 json={
@@ -197,7 +197,7 @@ class ChatApiWeekdaySmokeTests(unittest.TestCase):
         self.assertEqual(response.json()["response"], "emploi de temps de 1IDSD2")
 
     def test_compact_user_class_is_injected_into_schedule_followup(self):
-        with patch("app.routes.chat.SQLAgent.process_question", side_effect=lambda question: question):
+        with patch("app.routes.chat.SQLAgent.process_routed_question", side_effect=lambda intent, question, confidence=1.0: question):
             response = self.client.post(
                 "/api/chat",
                 json={
@@ -216,7 +216,7 @@ class ChatApiWeekdaySmokeTests(unittest.TestCase):
             {"role": "user", "content": "emploi de temps de 2gii3"},
             {"role": "assistant", "content": "Voici votre emploi du temps."},
         ]
-        with patch("app.routes.chat.SQLAgent.process_question", side_effect=lambda question: question):
+        with patch("app.routes.chat.SQLAgent.process_routed_question", side_effect=lambda intent, question, confidence=1.0: question):
             response = self.client.post(
                 "/api/chat",
                 json={
@@ -234,7 +234,7 @@ class ChatApiWeekdaySmokeTests(unittest.TestCase):
             university_info_service,
             "answer_question",
             return_value="Lien GII",
-        ) as answer_mock, patch("app.routes.chat.SQLAgent.process_question") as process_mock:
+        ) as answer_mock, patch("app.routes.chat.SQLAgent.process_routed_question") as process_mock:
             response = self.client.post(
                 "/api/chat",
                 json={
@@ -258,7 +258,7 @@ class ChatApiWeekdaySmokeTests(unittest.TestCase):
             university_info_service,
             "answer_question",
             return_value="Liens plans",
-        ) as answer_mock, patch("app.routes.chat.SQLAgent.process_question") as process_mock:
+        ) as answer_mock, patch("app.routes.chat.SQLAgent.process_routed_question") as process_mock:
             response = self.client.post(
                 "/api/chat",
                 json={
@@ -278,7 +278,7 @@ class ChatApiWeekdaySmokeTests(unittest.TestCase):
             university_info_service,
             "answer_question",
             return_value="Lien GII compact",
-        ) as answer_mock, patch("app.routes.chat.SQLAgent.process_question") as process_mock:
+        ) as answer_mock, patch("app.routes.chat.SQLAgent.process_routed_question") as process_mock:
             response = self.client.post(
                 "/api/chat",
                 json={
@@ -293,12 +293,95 @@ class ChatApiWeekdaySmokeTests(unittest.TestCase):
         answer_mock.assert_called_once_with("plan detude de gii")
         process_mock.assert_not_called()
 
+    def test_plan_etude_without_preposition_is_sent_directly_to_university_service(self):
+        with patch.object(
+            university_info_service,
+            "answer_question",
+            return_value="Lien GII sans preposition",
+        ) as answer_mock, patch("app.routes.chat.SQLAgent.process_routed_question") as process_mock:
+            response = self.client.post(
+                "/api/chat",
+                json={
+                    "message": "plan etude gii",
+                    "user_role": "student",
+                    "history": [],
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["response"], "Lien GII sans preposition")
+        answer_mock.assert_called_once_with("plan etude gii")
+        process_mock.assert_not_called()
+
+    def test_professor_schedule_typo_is_not_sent_to_generic_clarification(self):
+        with patch.object(SQLAgent, "_professor_confirmation_message", return_value=None), patch(
+            "app.routes.chat.SQLAgent.process_routed_question",
+            side_effect=lambda intent, question, confidence=1.0: question,
+        ):
+            response = self.client.post(
+                "/api/chat",
+                json={
+                    "message": "emploi de tempss de smaoui souhaail",
+                    "user_role": "student",
+                    "history": [],
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["response"], "emploi du temps de SMAOUI Souhail")
+
+    def test_all_classes_question_is_routed_to_sql_agent_not_university_service(self):
+        with patch.object(
+            university_info_service,
+            "answer_question",
+            return_value="fallback university",
+        ) as answer_mock, patch(
+            "app.routes.chat.SQLAgent.process_routed_question",
+            return_value="Voici les classes disponibles a ENET'Com :\n- 1 MP SE",
+        ) as process_mock:
+            response = self.client.post(
+                "/api/chat",
+                json={
+                    "message": "quels sont les classes existes dans enetcom",
+                    "user_role": "student",
+                    "history": [],
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("Voici les classes disponibles", response.json()["response"])
+        process_mock.assert_called_once()
+        answer_mock.assert_not_called()
+
+    def test_class_count_question_is_routed_to_sql_agent_not_university_service(self):
+        with patch.object(
+            university_info_service,
+            "answer_question",
+            return_value="fallback university",
+        ) as answer_mock, patch(
+            "app.routes.chat.SQLAgent.process_routed_question",
+            return_value="ENET'Com compte 42 classes dans la base de donnees.",
+        ) as process_mock:
+            response = self.client.post(
+                "/api/chat",
+                json={
+                    "message": "combien de classe dans enetcom",
+                    "user_role": "student",
+                    "history": [],
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("compte 42 classes", response.json()["response"])
+        process_mock.assert_called_once()
+        answer_mock.assert_not_called()
+
     def test_professor_confirmation_yes_skips_conversational_fallback(self):
         history = [
             {"role": "user", "content": "emploi de temps de ali khalflah"},
             {"role": "assistant", "content": "Le nom 'ali khalflah' ressemble a 'KHALFALLAH Ali'. Voulez-vous dire ce professeur ?"},
         ]
-        with patch("app.routes.chat.SQLAgent.process_question", side_effect=lambda question: question):
+        with patch("app.routes.chat.SQLAgent.process_routed_question", side_effect=lambda intent, question, confidence=1.0: question):
             response = self.client.post(
                 "/api/chat",
                 json={
@@ -316,7 +399,7 @@ class ChatApiWeekdaySmokeTests(unittest.TestCase):
             {"role": "user", "content": "ou ce trouve mr ali khalfalah maintenant"},
             {"role": "assistant", "content": "Le nom 'ali khalfalah' ressemble a 'KHALFALLAH Ali'. Voulez-vous dire ce professeur ?"},
         ]
-        with patch("app.routes.chat.SQLAgent.process_question", side_effect=lambda question: question):
+        with patch("app.routes.chat.SQLAgent.process_routed_question", side_effect=lambda intent, question, confidence=1.0: question):
             response = self.client.post(
                 "/api/chat",
                 json={
@@ -328,6 +411,24 @@ class ChatApiWeekdaySmokeTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["response"], "ou se trouve KHALFALLAH Ali")
+
+    def test_pending_confirmation_no_returns_reformulation_message(self):
+        history = [
+            {"role": "user", "content": "emploi de temps de ali khalflah"},
+            {"role": "assistant", "content": "Le nom 'ali khalflah' ressemble a 'KHALFALLAH Ali'. Voulez-vous dire ce professeur ?"},
+        ]
+
+        response = self.client.post(
+            "/api/chat",
+            json={
+                "message": "non",
+                "user_role": "student",
+                "history": history,
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("Reformulez", response.json()["response"])
 
     def test_single_name_professor_schedule_asks_for_professor_confirmation_not_class(self):
         with patch(
@@ -347,6 +448,111 @@ class ChatApiWeekdaySmokeTests(unittest.TestCase):
         body = response.json()["response"]
         self.assertIn("FRIKHA Soulef", body)
         self.assertNotIn("Quelle est votre classe", body)
+
+    def test_short_day_followup_uses_previous_schedule_context(self):
+        history = [
+            {"role": "user", "content": "emploi de temps de 2gii3"},
+            {"role": "assistant", "content": "Voici votre emploi du temps."},
+        ]
+        with patch("app.routes.chat.SQLAgent.process_routed_question", side_effect=lambda intent, question, confidence=1.0: question):
+            response = self.client.post(
+                "/api/chat",
+                json={
+                    "message": "et demain ?",
+                    "user_role": "student",
+                    "history": history,
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["response"], "emploi du temps de 2 ING GII 3 demain")
+
+    def test_short_study_plan_followup_uses_previous_university_context(self):
+        history = [
+            {"role": "user", "content": "montre moi les plans d'etude"},
+            {"role": "assistant", "content": "Voici les URLs des plans d'etudes ENET'Com."},
+        ]
+        with patch.object(
+            university_info_service,
+            "answer_question",
+            return_value="Lien GII contextual",
+        ) as answer_mock:
+            response = self.client.post(
+                "/api/chat",
+                json={
+                    "message": "et pour gii ?",
+                    "user_role": "student",
+                    "history": history,
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["response"], "Lien GII contextual")
+        answer_mock.assert_called_once_with("plan etude gii")
+
+    def test_short_count_followup_uses_previous_all_classes_context(self):
+        history = [
+            {"role": "user", "content": "quelles classes existent dans enetcom"},
+            {"role": "assistant", "content": "Voici les classes disponibles a ENET'Com :"},
+        ]
+        with patch("app.routes.chat.SQLAgent.process_routed_question", side_effect=lambda intent, question, confidence=1.0: question):
+            response = self.client.post(
+                "/api/chat",
+                json={
+                    "message": "combien ?",
+                    "user_role": "student",
+                    "history": history,
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["response"], "combien de classes dans enetcom")
+
+    def test_greeting_returns_warm_deterministic_response(self):
+        response = self.client.post(
+            "/api/chat",
+            json={
+                "message": "bonjour",
+                "user_role": "student",
+                "history": [],
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()["response"].lower()
+        self.assertIn("bonjour", body)
+        self.assertIn("emploi du temps", body)
+        self.assertIn("absences", body)
+
+    def test_greeting_with_typo_is_still_recognized(self):
+        response = self.client.post(
+            "/api/chat",
+            json={
+                "message": "saluuutt",
+                "user_role": "student",
+                "history": [],
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()["response"].lower()
+        self.assertIn("bonjour", body)
+        self.assertIn("professeurs", body)
+
+    def test_greeting_with_status_gets_natural_reply(self):
+        response = self.client.post(
+            "/api/chat",
+            json={
+                "message": "salut cv",
+                "user_role": "student",
+                "history": [],
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()["response"].lower()
+        self.assertIn("je vais bien", body)
+        self.assertIn("merci", body)
 
 
 if __name__ == "__main__":
