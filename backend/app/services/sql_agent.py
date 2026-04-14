@@ -419,16 +419,6 @@ class SQLAgent:
                 for candidate_token in candidate_tokens
             )
 
-        strong_token_matches = 0
-        for requested_token in requested_tokens:
-            token_scores = [
-                self._string_similarity(requested_token, candidate_token)
-                for candidate_token in candidate_tokens
-            ]
-            best_token_score = max(token_scores) if token_scores else 0.0
-            if best_token_score >= 0.82:
-                strong_token_matches += 1
-
         surname_score = self._surname_similarity(requested_name, candidate_name)
         first_score = max(self._string_similarity(requested_tokens[0], candidate_token) for candidate_token in candidate_tokens)
         same_surname_initial = any(candidate_token[:1] == requested_tokens[-1][:1] for candidate_token in candidate_tokens if candidate_token)
@@ -440,7 +430,7 @@ class SQLAgent:
             for cand in candidate_tokens
             if req == cand or req.startswith(cand) or cand.startswith(req)
         }
-        return strong_token_matches >= 2 and (
+        return (
             surname_score >= 0.72
             or (surname_score >= 0.58 and first_score >= 0.82)
             or (first_score >= 0.9 and same_surname_initial and self._has_professor_connector_token(candidate_name))
@@ -1866,14 +1856,7 @@ class SQLAgent:
     def _teacher_prof_schedule_sql(self, question: str, context: dict) -> Tuple[str, Dict[str, Any]]:
         prof_name = self._extract_schedule_prof_candidate(question) or self._extract_prof_candidate(question) or ""
         prof_name = self._resolve_professor_name(prof_name) or prof_name
-        prof_condition = self._best_professor_match_condition(prof_name, "te.professeur_nom_complet")
-        if not prof_condition:
-            fallback_key = "".join(self._normalized_token_parts(self._clean_professor_display_name(prof_name)))
-            if fallback_key:
-                expr = "REPLACE(REPLACE(REPLACE(LOWER(te.professeur_nom_complet), ' ', ''), '.', ''), '-', '')"
-                prof_condition = f"{expr} = '{fallback_key}'"
-            else:
-                prof_condition = "1=0"
+        prof_condition = self._best_professor_match_condition(prof_name, "te.professeur_nom_complet") or "1=0"
         requested_day = self._extract_requested_day(question, context)
         sql = f"""
         SELECT
@@ -1899,62 +1882,6 @@ class SQLAgent:
             sql += " AND LOWER(te.jour) = LOWER(:target_day)\n"
             params["target_day"] = requested_day
         sql += " ORDER BY CASE LOWER(te.jour) WHEN 'lundi' THEN 1 WHEN 'mardi' THEN 2 WHEN 'mercredi' THEN 3 WHEN 'jeudi' THEN 4 WHEN 'vendredi' THEN 5 WHEN 'samedi' THEN 6 WHEN 'dimanche' THEN 7 ELSE 8 END, te.heure_debut, te.heure_fin;"
-        return sql, params
-
-    def _seance_prof_schedule_sql(self, question: str, context: dict) -> Tuple[str, Dict[str, Any]]:
-        prof_name = self._extract_schedule_prof_candidate(question) or self._extract_prof_candidate(question) or ""
-        prof_name = self._resolve_professor_name(prof_name) or prof_name
-        prof_condition = self._best_professor_match_condition(prof_name, "p.nom_complet")
-        if not prof_condition:
-            fallback_key = "".join(self._normalized_token_parts(self._clean_professor_display_name(prof_name)))
-            if fallback_key:
-                expr = "REPLACE(REPLACE(REPLACE(LOWER(p.nom_complet), ' ', ''), '.', ''), '-', '')"
-                prof_condition = f"{expr} = '{fallback_key}'"
-            else:
-                prof_condition = "1=0"
-        requested_day = self._extract_requested_day(question, context)
-
-        sql = f"""
-        SELECT
-            c.nom AS classe,
-            m.nom AS matiere,
-            p.nom_complet AS professeur,
-            sa.nom AS salle,
-            s.jour,
-            s.heure_debut,
-            s.heure_fin,
-            s.type_seance
-        FROM seances s
-        JOIN emplois_versions v ON v.id = s.version_id AND v.actif = true AND v.classe_id = s.classe_id
-        JOIN professeurs p ON p.id = s.professeur_id
-        LEFT JOIN classes c ON c.id = s.classe_id
-        LEFT JOIN matieres m ON m.id = s.matiere_id
-        LEFT JOIN salles sa ON sa.id = s.salle_id
-        WHERE {prof_condition}
-        """
-        params: Dict[str, Any] = {}
-        requested_periode = self._schedule_periode_name(question, context)
-        if requested_periode and context.get("semestre_id"):
-            sql += """
-            AND s.periode_id = (
-                SELECT p2.id
-                FROM periodes p2
-                WHERE p2.semestre_id = :semester_id
-                  AND UPPER(p2.nom) = :periode_nom
-                LIMIT 1
-            )\n
-            """
-            params["semester_id"] = int(context["semestre_id"])
-            params["periode_nom"] = requested_periode
-        if requested_day:
-            sql += " AND LOWER(s.jour) = LOWER(:target_day)\n"
-            params["target_day"] = requested_day
-        sql += (
-            " ORDER BY CASE LOWER(s.jour) "
-            "WHEN 'lundi' THEN 1 WHEN 'mardi' THEN 2 WHEN 'mercredi' THEN 3 "
-            "WHEN 'jeudi' THEN 4 WHEN 'vendredi' THEN 5 WHEN 'samedi' THEN 6 "
-            "WHEN 'dimanche' THEN 7 ELSE 8 END, s.heure_debut, s.heure_fin;"
-        )
         return sql, params
 
     def _schedule_periode_name(self, question: str, context: dict) -> Optional[str]:
@@ -3053,10 +2980,7 @@ class SQLAgent:
             prof = self._extract_schedule_prof_candidate(question) or self._extract_prof_candidate(question)
             if prof and not self._prof_exists_in_db(prof):
                 return None, {}, self._prof_not_found_message(prof)
-            if self._teacher_prof_exists_in_db(prof or ""):
-                sql_query, params = self._teacher_prof_schedule_sql(question, context)
-            else:
-                sql_query, params = self._seance_prof_schedule_sql(question, context)
+            sql_query, params = self._teacher_prof_schedule_sql(question, context) if self._teacher_prof_exists_in_db(prof or "") else ("", {})
             return sql_query, params, None
 
         return None, {}, None
@@ -3126,82 +3050,6 @@ class SQLAgent:
 
         return self._exec_and_format_v2(question, sql_query, {}, context, use_llm_formatter=False)
 
-    def _extract_prof_candidate(self, question: str) -> Optional[str]:
-        q = (question or "").strip()
-        if self._is_schedule_intent(q) and self._extract_class_candidate(q):
-            return None
-        name_pattern = r"[A-Za-zÀ-ÖØ-öø-ÿ'\-]"
-
-        def _strip_trailing_time_words(value: str) -> str:
-            return re.sub(
-                r"\b(lundi|mardi|mercredi|jeudi|vendredi|samedi|dimanche|aujourd'hui|aujourdhui|demain|hier|maintenant|actuellement|mtn|en ce moment)\b.*$",
-                "",
-                value or "",
-                flags=re.IGNORECASE,
-            ).strip()
-
-        match = re.search(
-            rf"\b(mr|mme|m\.|monsieur|madame)\s+(({name_pattern}+(?:\s+{name_pattern}+){1,3}))\b",
-            q,
-            re.IGNORECASE,
-        )
-        if match:
-            candidate = _strip_trailing_time_words(match.group(2).strip())
-            return candidate if self._is_valid_prof_candidate_text(candidate) else None
-
-        match = re.search(
-            rf"\bde\s+({name_pattern}+(?:\s+{name_pattern}+){1,3})\b",
-            q,
-            re.IGNORECASE,
-        )
-        if match:
-            candidate = _strip_trailing_time_words(match.group(1).strip())
-        else:
-            fallback_match = re.search(
-                rf"(?:dans quelle classe se trouve|ou se trouve|pour quelle classe|quelle classe pour)\s+({name_pattern}+(?:\s+{name_pattern}+){0,3})$",
-                q,
-                re.IGNORECASE,
-            )
-            if fallback_match:
-                candidate = _strip_trailing_time_words(fallback_match.group(1).strip())
-            else:
-                bare_match = re.fullmatch(rf"\s*({name_pattern}+(?:\s+{name_pattern}+){1,3})\s*", q)
-                if not bare_match or self._extract_class_candidate(q):
-                    return None
-                candidate = _strip_trailing_time_words(bare_match.group(1).strip())
-
-        if not self._is_valid_prof_candidate_text(candidate):
-            return None
-
-        return candidate
-
-    def _extract_schedule_prof_candidate(self, question: str) -> Optional[str]:
-        prof = self._extract_prof_candidate(question)
-        if prof:
-            return prof
-        if not self._is_schedule_intent(question) or self._extract_class_candidate(question) or self._extract_room_candidate(question):
-            return None
-        name_pattern = r"[A-Za-zÀ-ÖØ-öø-ÿ'\-]"
-
-        match = re.search(
-            rf"\bemploi(?:s)?\s+(?:du|de)\s+temps+\s+de\s+({name_pattern}+(?:\s+{name_pattern}+){1,3})\s*$",
-            question or "",
-            re.IGNORECASE,
-        )
-        if not match:
-            single_word_match = re.search(
-                r"\bemploi(?:s)?\s+(?:du|de)\s+temps+\s+de\s+([A-Za-z'\-]+)\s*$",
-                question or "",
-                re.IGNORECASE,
-            )
-            if not single_word_match:
-                return None
-            candidate = single_word_match.group(1).strip()
-            return candidate if self._is_valid_prof_candidate_text(candidate) else None
-
-        candidate = match.group(1).strip()
-        return candidate if self._is_valid_prof_candidate_text(candidate) else None
-
     # ---------------------------------------------------------------------
     # Public API
     # ---------------------------------------------------------------------
@@ -3270,11 +3118,9 @@ class SQLAgent:
                 return confirmation
             if prof and not self._prof_exists_in_db(prof):
                 return self._prof_not_found_message(prof)
-            if self._teacher_prof_exists_in_db(prof or ""):
-                sql_query, params = self._teacher_prof_schedule_sql(question, context)
-            else:
-                sql_query, params = self._seance_prof_schedule_sql(question, context)
-            return self._exec_and_format(question, sql_query, params, context)
+            sql_query, params = self._teacher_prof_schedule_sql(question, context) if self._teacher_prof_exists_in_db(prof or "") else ("", {})
+            if sql_query:
+                return self._exec_and_format(question, sql_query, params, context)
 
         if self._is_prof_location_question(question):
             prof = self._extract_prof_candidate(question)

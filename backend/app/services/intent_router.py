@@ -927,12 +927,6 @@ class IntentRouter:
             self._infer_academic_intent(message, normalized, entities)
             or self._is_direct_university_question(normalized)
             or self._is_calendar_question(normalized)
-            or self._contains_any_marker(normalized, "schedule")
-            or self._contains_any_marker(normalized, "class_location")
-            or self._contains_any_marker(normalized, "professor_location")
-            or self._contains_any_marker(normalized, "professor_class")
-            or self._contains_any_marker(normalized, "professor_current_course")
-            or self._contains_any_marker(normalized, "professor_has_course")
         )
 
     def _extract_pending_request(self, history: list) -> Optional[tuple[str, str, str]]:
