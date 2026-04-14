@@ -419,6 +419,16 @@ class SQLAgent:
                 for candidate_token in candidate_tokens
             )
 
+        strong_token_matches = 0
+        for requested_token in requested_tokens:
+            token_scores = [
+                self._string_similarity(requested_token, candidate_token)
+                for candidate_token in candidate_tokens
+            ]
+            best_token_score = max(token_scores) if token_scores else 0.0
+            if best_token_score >= 0.82:
+                strong_token_matches += 1
+
         surname_score = self._surname_similarity(requested_name, candidate_name)
         first_score = max(self._string_similarity(requested_tokens[0], candidate_token) for candidate_token in candidate_tokens)
         same_surname_initial = any(candidate_token[:1] == requested_tokens[-1][:1] for candidate_token in candidate_tokens if candidate_token)
@@ -430,7 +440,7 @@ class SQLAgent:
             for cand in candidate_tokens
             if req == cand or req.startswith(cand) or cand.startswith(req)
         }
-        return (
+        return strong_token_matches >= 2 and (
             surname_score >= 0.72
             or (surname_score >= 0.58 and first_score >= 0.82)
             or (first_score >= 0.9 and same_surname_initial and self._has_professor_connector_token(candidate_name))
@@ -3049,6 +3059,80 @@ class SQLAgent:
             sql_query = self._strip_day_filter(sql_query)
 
         return self._exec_and_format_v2(question, sql_query, {}, context, use_llm_formatter=False)
+
+    def _extract_prof_candidate(self, question: str) -> Optional[str]:
+        q = (question or "").strip()
+        if self._is_schedule_intent(q) and self._extract_class_candidate(q):
+            return None
+
+        def _strip_trailing_time_words(value: str) -> str:
+            return re.sub(
+                r"\b(lundi|mardi|mercredi|jeudi|vendredi|samedi|dimanche|aujourd'hui|aujourdhui|demain|hier|maintenant|actuellement|mtn|en ce moment)\b.*$",
+                "",
+                value or "",
+                flags=re.IGNORECASE,
+            ).strip()
+
+        match = re.search(
+            r"\b(mr|mme|m\.|monsieur|madame)\s+([A-Za-zÃ€-Ã¿'\-]+(?:\s+[A-Za-zÃ€-Ã¿'\-]+){1,3})\b",
+            q,
+            re.IGNORECASE,
+        )
+        if match:
+            candidate = _strip_trailing_time_words(match.group(2).strip())
+            return candidate if self._is_valid_prof_candidate_text(candidate) else None
+
+        match = re.search(
+            r"\bde\s+([A-Za-zÃ€-Ã¿'\-]+(?:\s+[A-Za-zÃ€-Ã¿'\-]+){1,3})\b",
+            q,
+            re.IGNORECASE,
+        )
+        if match:
+            candidate = _strip_trailing_time_words(match.group(1).strip())
+        else:
+            fallback_match = re.search(
+                r"(?:dans quelle classe se trouve|ou se trouve|pour quelle classe|quelle classe pour)\s+([A-Za-zÃ€-Ã¿'\-]+(?:\s+[A-Za-zÃ€-Ã¿'\-]+){0,3})$",
+                q,
+                re.IGNORECASE,
+            )
+            if fallback_match:
+                candidate = _strip_trailing_time_words(fallback_match.group(1).strip())
+            else:
+                bare_match = re.fullmatch(r"\s*([A-Za-zÃ€-Ã¿'\-]+(?:\s+[A-Za-zÃ€-Ã¿'\-]+){1,3})\s*", q)
+                if not bare_match or self._extract_class_candidate(q):
+                    return None
+                candidate = _strip_trailing_time_words(bare_match.group(1).strip())
+
+        if not self._is_valid_prof_candidate_text(candidate):
+            return None
+
+        return candidate
+
+    def _extract_schedule_prof_candidate(self, question: str) -> Optional[str]:
+        prof = self._extract_prof_candidate(question)
+        if prof:
+            return prof
+        if not self._is_schedule_intent(question) or self._extract_class_candidate(question) or self._extract_room_candidate(question):
+            return None
+
+        match = re.search(
+            r"\bemploi(?:s)?\s+(?:du|de)\s+temps+\s+de\s+([A-Za-zÃ€-Ã¿'\-]+(?:\s+[A-Za-zÃ€-Ã¿'\-]+){1,3})\s*$",
+            question or "",
+            re.IGNORECASE,
+        )
+        if not match:
+            single_word_match = re.search(
+                r"\bemploi(?:s)?\s+(?:du|de)\s+temps+\s+de\s+([A-Za-z'\-]+)\s*$",
+                question or "",
+                re.IGNORECASE,
+            )
+            if not single_word_match:
+                return None
+            candidate = single_word_match.group(1).strip()
+            return candidate if self._is_valid_prof_candidate_text(candidate) else None
+
+        candidate = match.group(1).strip()
+        return candidate if self._is_valid_prof_candidate_text(candidate) else None
 
     # ---------------------------------------------------------------------
     # Public API
