@@ -101,7 +101,25 @@ class UniversityInfoService:
         normalized = normalized.replace("'", " ")
         normalized = re.sub(r"[^a-zA-Z0-9\s/-]", " ", normalized)
         normalized = re.sub(r"\s+", " ", normalized).strip()
-        return normalized.lower()
+        normalized = normalized.lower()
+        typo_fixes = {
+            "ghodwa": "demain",
+            "ghoudwa": "demain",
+            "ghedwa": "demain",
+            "lyoum": "aujourd hui",
+            "wa9tech": "quand",
+            "waqtech": "quand",
+            "win": "ou",
+            "na9ra": "j ai cours",
+            "naqra": "j ai cours",
+            "y9ari": "enseigne",
+            "yqari": "enseigne",
+            "ya9ra": "a cours",
+            "lavis": "avis",
+        }
+        for source, target in typo_fixes.items():
+            normalized = re.sub(rf"\b{re.escape(source)}\b", target, normalized)
+        return normalized
 
     def _html_to_text(self, html_content: str) -> str:
         text = re.sub(r"<script[\s\S]*?</script>", " ", html_content, flags=re.IGNORECASE)
@@ -287,6 +305,25 @@ class UniversityInfoService:
             seen.add(normalized)
             teachers.append(value)
 
+        if teachers:
+            return teachers
+
+        page_text = self._html_to_text(html_content or "")
+        card_name_patterns = [
+            r"\b([A-Z][A-Za-z' -]{1,60})\s+il y a \d+\s+jour",
+            r"\b([A-Z][A-Za-z' -]{1,60})\s+date\s*:",
+        ]
+        for pattern in card_name_patterns:
+            for match in re.finditer(pattern, page_text):
+                value = self._clean_display_text(match.group(1))
+                if not self._looks_like_absent_teacher(value):
+                    continue
+                normalized = self._normalize_text(value)
+                if normalized in seen:
+                    continue
+                seen.add(normalized)
+                teachers.append(value)
+
         return teachers
 
     def _extract_absence_snippet(self, page_text: str, max_chars: int = 700) -> Optional[str]:
@@ -339,6 +376,7 @@ class UniversityInfoService:
         ]
         if any(login_markers):
             return (
+                "Je ne peux pas identifier les enseignants absents sans une session connectee a l'Espace Extranet. "
                 "Pour consulter les absences des enseignants, l'etudiant doit d'abord se connecter a l'Espace Extranet. "
                 f"Ensuite, il peut ouvrir cette page : {self.ABSENCES_URL}"
             )

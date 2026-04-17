@@ -30,13 +30,28 @@ CONVERSATION_MARKERS = (
     "hey",
     "salam",
     "slm",
+    "aaslema",
+    "aslema",
+    "asslema",
+    "ahla",
+    "marhba",
+    "mar7ba",
+    "sbah khir",
+    "sbah lkhir",
+    "sbeh lkhir",
+    "sbeh el khir",
+    "msa lkhir",
+    "masa lkhir",
     "cc",
 )
 THANKS_MARKERS = (
     "merci",
     "thanks",
     "thank you",
-    "jazak",
+    "aaychek",
+    "aychek",
+    "3aychek",
+    "barak allah fik",
 )
 HELP_MARKERS = (
     "aide",
@@ -315,31 +330,22 @@ Last user message:
             return None
 
         history_text = self._history_as_text(history)
-        prompt = f"""Classify the last user message for an ENET'Com assistant.
+        prompt = f"""Classify the intent of the last user message for an ENET'Com university assistant.
 
-Return exactly one label:
-- GREETING: greeting, thanks, casual conversation, asking who the assistant is, or asking what it can do
-- TIMETABLE: timetable, classes, rooms, teachers, courses, absences, exams, holidays, or schedule-related requests
-- ENETCOM_INFO: ENET'Com information such as departments, contact, administration, studies, student services, clubs, internships, PFE, news, or website information
-- OUT_OF_SCOPE: requests unrelated to ENET'Com
+Return exactly ONE label from these options:
+- GREETING: casual greetings, politeness, thanks, or meta-questions about what the assistant can do
+- TIMETABLE: questions about class schedules, professor schedules, room availability, course timing, academic calendar events, or any schedule-related inquiry
+- ENETCOM_INFO: questions about institutional information including departments, contact details, study programs, clubs, internships, PFE projects, university services, or official ENET'Com details
+- OUT_OF_SCOPE: requests completely unrelated to ENET'Com or the assistant's purpose
 
-Rules:
-- If the message mixes a greeting with a real ENET'Com request, choose the request label, not GREETING.
-- Short follow-ups like "et demain ?", "pour gii", or "et les contacts ?" should use recent history to infer the most likely ENET'Com intent.
-- If you are unsure between TIMETABLE and ENETCOM_INFO, use TIMETABLE only for schedule/class/room/teacher/calendar needs. Otherwise use ENETCOM_INFO.
-- Return only the label, nothing else.
+Understanding rules:
+1. Parse multilingual input: The message may be in French, Arabic, English, or mixed.
+2. Tolerate bad writing: Users may write with typos, misspellings, missing accents, abbreviations, slang, Tunisian Darija, Arabizi, or poor grammar.
+3. Infer missing context: Use the recent conversation history to understand incomplete follow-ups or pronouns.
+4. Combine intent and real request: If the message mixes a greeting with an actual ENET'Com request, prioritize the real request, not GREETING.
+5. Disambiguate TIMETABLE vs ENETCOM_INFO: Use TIMETABLE only when the core intent is about schedules, timing, rooms, or professors' classes. Otherwise use ENETCOM_INFO.
 
-Examples:
-- "bonjour" -> GREETING
-- "salut, tu peux faire quoi ?" -> GREETING
-- "merci beaucoup" -> GREETING
-- "bonjour, j'ai quoi demain ?" -> TIMETABLE
-- "ou est mr ben amor maintenant" -> TIMETABLE
-- "salle libre aujourd'hui" -> TIMETABLE
-- "donne moi le contact de l'ecole" -> ENETCOM_INFO
-- "quelles sont les actualites d'enetcom" -> ENETCOM_INFO
-- "plan d'etude gii" -> ENETCOM_INFO
-- "quel est le prix de l'or" -> OUT_OF_SCOPE
+Return only the one-word label, nothing else.
 
 Recent history:
 {history_text or "None"}
@@ -354,12 +360,12 @@ Last user message:
                 "messages": [
                     {
                         "role": "system",
-                        "content": "You classify requests for an ENET'Com assistant. Return exactly one label: GREETING, TIMETABLE, ENETCOM_INFO, or OUT_OF_SCOPE.",
+                        "content": "You are an expert multilingual intent classifier for a university assistant. You understand French, Arabic, English, and code-mixed messages. You handle typos, bad spelling, abbreviations, slang, and poor grammar. You deeply understand user intent despite imperfect writing. Always classify accurately and return only one label from the four categories provided.",
                     },
                     {"role": "user", "content": prompt},
                 ],
                 "temperature": 0.0,
-                "max_tokens": 12,
+                "max_tokens": 15,
             },
             timeout=15,
         )
@@ -407,22 +413,22 @@ Last user message:
             return None
 
         history_text = self._history_as_text(history)
-        prompt = f"""You are the query-understanding engine for an ENET'Com assistant.
+        prompt = f"""You are a powerful multilingual query analyzer for an ENET'Com university assistant system.
 
-Return exactly one JSON object that captures the user's intended ENET'Com request.
+Core mission:
+- Understand the MEANING of user queries, not literal spelling or grammar.
+- Accept input in French, Arabic, English, Tunisian Darija, Arabizi/Franco-Arabic, or mixtures of these languages.
+- Tolerate all forms of bad writing: typos, missing accents, abbreviations, slang, phonetic spelling, merged words, repeated letters, incomplete sentences, or casual grammar.
+- Recover intended meaning from context, recent conversation history, and reasonable inference.
+- Return exactly one JSON object that captures the user's true intent and what information they need.
 
-Mission:
-- Understand meaning, not spelling.
-- The user may write with typos, phonetic spelling, missing accents, merged/split words, repeated letters, omitted words, or shorthand.
-- Recover the intended request whenever the meaning is reasonably inferable from the latest message and relevant history.
-
-ENET'Com scope:
-- Timetables and schedules for classes, professors, and rooms
-- Professor location, current course, teaching class, or whether a professor has class
-- Available rooms
-- Academic calendar: holidays, exams, revision periods, dates
-- Institutional information: study plans, formations, departments, contacts, clubs, internships, PFE, services, absences, news, official website information
-- Small talk: greeting, thanks, politeness, capability questions
+ENET'Com domain scope:
+- Schedule and timetable queries: any question about when classes happen, professor availability, room bookings, course timing
+- Location queries: where professors are, where classes meet, which rooms are available
+- Calendar queries: academic dates, holidays, exam periods, revision times, important dates
+- Institutional queries: university services, study programs, departments, club information, internship details, PFE projects, official contact information, university news
+- Students and staff: conversations about students, teacher schedules, class assignments
+- Conversational: greetings, thanks, general questions about assistant capabilities
 
 Valid intent values:
 - GREETING
@@ -451,7 +457,9 @@ Valid answer_source values:
 Decision rules:
 - Use recent history only to resolve omitted references or short follow-ups.
 - If the latest message contains both small talk and a real request, choose the real request.
+- Treat Tunisian Arabic, Arabizi, and mixed-language phrasing as semantically valid user language, not as noise.
 - If the request is timetable/room/professor/class related, answer_source must be DATABASE.
+- If the request is about holidays, vacations, exams, revision periods, or academic dates, intent must be CALENDAR and answer_source must be DATABASE.
 - If the request is about official ENET'Com information, answer_source must be UNIVERSITY_SITE.
 - If the request is casual conversation, answer_source must be SMALLTALK.
 - If unrelated to ENET'Com, answer_source must be OUT_OF_SCOPE.
@@ -468,12 +476,13 @@ Intent rules:
 - CALENDAR: holidays, exams, revision periods, academic dates.
 - ENETCOM_INFO: institutional information outside the calendar.
 
-Entity rules:
-- Fill class_name only when the request supports a class/group target.
-- Fill professor_name only when the request supports a person/professor target.
-- Fill room_name only when the request supports a room target.
-- Fill day_hint/time_hint when the message implies today, tomorrow, now, a weekday, or equivalent timing.
-- Fill university_topic only for institutional topics such as study_plan, absence, contact, department, formation, clubs, pfe, internship, news, services, or similar.
+Entity extraction rules:
+- class_name: Extract only when the user is clearly asking about a specific class, group, or cohort. Be flexible with formatting variations and abbreviations.
+- professor_name: Extract only when the user is asking about a specific person or teacher. Handle titles (Mr, Ms, Dr) and first/last name variations.
+- room_name: Extract only when asking about a specific room or physical location. Accept all formatting variations.
+- day_hint: Extract when the message references timing (today, tomorrow, Monday, next week, etc.) in any language or casual variation.
+- time_hint: Extract when asking about specific clock times or time periods.
+- university_topic: Extract when asking about institutional information (contact, programs, services, etc.).
 
 Strict negative rules:
 - Never invent a class, professor, room, or topic unsupported by the latest message plus necessary context.
@@ -482,6 +491,9 @@ Strict negative rules:
 - Never output professor_name if the request only supports a room or class target.
 - Never output room_name if the request only supports a professor or class target.
 - Never output class_name if the request only supports a professor or room target.
+- Never choose a class-oriented interpretation when the target clearly looks like a person name.
+- Never ask for a class implicitly if a professor_name is already recoverable from the message.
+- Never classify holidays, vacances, exam dates, or revision periods as ENETCOM_INFO when they are calendar-related.
 
 Ambiguity rules:
 - If a timetable request is ambiguous, prefer:
@@ -491,17 +503,29 @@ Ambiguity rules:
 - If the exact subtype is uncertain but the request is clearly timetable-related, choose the closest DATABASE intent and lower confidence.
 - Prefer a low-confidence meaningful ENET'Com interpretation over OUT_OF_SCOPE when the intended meaning is reasonably recoverable.
 
-Rewrite rules:
-- standalone_query must be a clean autonomous ENET'Com query in French.
-- standalone_query must preserve the user's meaning while correcting noisy spelling when recoverable.
-- standalone_query must explicitly mention the resolved class, professor, room, day, time, or institutional topic when known.
-- If the message is noisy but understandable, output the corrected interpretation in standalone_query, not the noisy wording.
-- For GREETING or OUT_OF_SCOPE, standalone_query must be null.
+Normalization rules:
+- standalone_query: Rewrite the user's query as clean, grammatically correct French when it contains an actual ENET'Com request.
+- PURPOSE: Clean up typos, abbreviations, slang, and bad grammar while preserving the original meaning.
+- Always normalize to standard French vocabulary and spelling.
+- Convert Tunisian/Arabizi wording into clear French meaning when possible, while preserving the user's real target and timeframe.
+- Include resolved entities (class name, professor name, room, timing) in the normalized query.
+- For DATABASE intents, prefer short canonical French forms such as:
+  - "emploi du temps de <professeur>"
+  - "emploi du temps de <classe>"
+  - "emploi du temps de salle <salle>"
+  - "ou se trouve <professeur>"
+  - "dans quelle classe se trouve <professeur>"
+  - "quels sont les examens prevus"
+  - "quelles sont les vacances prevues"
+- If the original message is just greeting, thanks, or completely out-of-scope: set standalone_query to null.
 
-Confidence rules:
-- confidence must be a number between 0 and 1.
-- High confidence only when meaning and target are reasonably clear.
-- Lower confidence when ambiguity remains after contextual interpretation.
+Confidence scoring:
+- confidence: Floating point 0.0 to 1.0 representing how confident you are in the interpretation.
+- 0.95-1.0: Message is crystal clear with no ambiguity.
+- 0.7-0.95: Message is clear but required normalization or context inference.
+- 0.5-0.7: Message is understandable but ambiguous or required significant normalization.
+- 0.3-0.5: Message requires educated guessing based on context.
+- Prefer confident meaningful interpretation over OUT_OF_SCOPE when possible.
 
 Return only this JSON schema:
 {{
@@ -530,12 +554,12 @@ Last user message:
                 "messages": [
                     {
                         "role": "system",
-                        "content": "You understand ENET'Com user requests, choose the correct answer source, and return exactly one JSON object with the requested schema.",
+                        "content": "You are a world-class multilingual query understanding system designed for a university timetable assistant. You understand queries in French, Arabic, English, and mixed languages. You expertly handle bad spelling, typos, abbreviations, slang, incomplete sentences—like ChatGPT or Claude. Your job is to understand what users really want when they ask about university timetables, professor schedules, room availability, or institutional information, regardless of how they write it. Extract the true intent and entities from messy, informal, or misspelled input. Return valid JSON with the exact schema requested.",
                     },
                     {"role": "user", "content": prompt},
                 ],
                 "temperature": 0.0,
-                "max_tokens": 320,
+                "max_tokens": 400,
                 "response_format": {"type": "json_object"},
             },
             timeout=20,
@@ -617,7 +641,51 @@ Last user message:
         )
 
     def build_smalltalk_response(self, message: str, user_class: Optional[str] = None) -> str:
-        return self._fallback_conversational_response(message, user_class)
+        if not self.enabled:
+            return self._fallback_conversational_response(message, user_class)
+
+        prompt = f"""Tu es un assistant conversationnel ENET'Com.
+
+Le message utilisateur est une salutation, un remerciement, une formule de politesse ou un petit message conversationnel.
+
+Consignes:
+- Reponds naturellement, chaleureusement, et tres brievement.
+- Comprends le francais, l'anglais, l'arabe, le tunisien, et l'arabizi.
+- Si c'est une salutation ou un remerciement tunisien/darija/arabe romanise, reponds comme a une vraie formule de politesse.
+- Tu peux rappeler en une phrase courte que tu aides sur l'emploi du temps, les salles, les professeurs, les absences et les infos ENET'Com.
+- Pas de markdown.
+
+Message utilisateur:
+{message}
+"""
+
+        response = self._post_with_retry(
+            {
+                "model": self.model,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": "Tu es un assistant conversationnel ENET'Com, chaleureux, naturel, concis, capable de comprendre le tunisien, l'arabizi, le francais, l'arabe et l'anglais.",
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                "temperature": 0.3,
+                "max_tokens": 120,
+            },
+            timeout=20,
+        )
+        if response is None or response.status_code != 200:
+            if response is not None:
+                self._handle_auth_error(response, "Groq smalltalk error")
+                print(f"Groq smalltalk error: {response.status_code} - {response.text}")
+            return self._fallback_conversational_response(message, user_class)
+
+        payload = self._safe_json(response)
+        if not payload:
+            return self._fallback_conversational_response(message, user_class)
+
+        raw = (payload.get("choices", [{}])[0].get("message", {}).get("content", "") or "").strip()
+        return self._postprocess_response(raw) if raw else self._fallback_conversational_response(message, user_class)
 
     def _fallback_out_of_scope_response(self, message: str) -> str:
         q = self._normalize_text(message)

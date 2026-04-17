@@ -325,6 +325,7 @@ class IntentRouterTests(unittest.TestCase):
 
         self.assertEqual(decision.intent, IntentLabel.PROF_SCHEDULE.value)
         self.assertEqual(decision.entities.professor_candidate, "BEN SLIMA Mohamed")
+        self.assertEqual(decision.full_question, "emploi du temps de BEN SLIMA Mohamed")
 
     def test_noisy_professor_schedule_from_model_is_not_blocked_when_query_is_clear(self):
         router = IntentRouter(
@@ -350,6 +351,56 @@ class IntentRouterTests(unittest.TestCase):
         self.assertEqual(decision.intent, IntentLabel.PROF_SCHEDULE.value)
         self.assertEqual(decision.execution_target, ExecutionTarget.SQL_AGENT.value)
         self.assertEqual(decision.full_question, "emploi du temps de KHALFALLAH Ali")
+
+    def test_model_professor_schedule_is_rewritten_with_canonical_professor_name(self):
+        router = IntentRouter(
+            DummyGroqService(
+                analysis_result={
+                    "intent": "PROF_SCHEDULE",
+                    "answer_source": "DATABASE",
+                    "confidence": 0.8,
+                    "standalone_query": "Quel est l'emploi du temps d'Ali Khalfalah",
+                    "class_name": None,
+                    "professor_name": "Ali Khalfalah",
+                    "room_name": None,
+                    "day_hint": None,
+                    "time_hint": None,
+                    "university_topic": None,
+                }
+            ),
+            db=FakeDb(class_names=[], professor_names=["KHALFALLAH Ali"]),
+        )
+
+        decision = router.route("emploi de temps de ali khalfalah", history=[], user_class=None, agent=DummyAgent())
+
+        self.assertEqual(decision.intent, IntentLabel.PROF_SCHEDULE.value)
+        self.assertEqual(decision.entities.professor_candidate, "KHALFALLAH Ali")
+        self.assertEqual(decision.full_question, "emploi du temps de KHALFALLAH Ali")
+
+    def test_model_professor_schedule_ignores_bad_standalone_query_shape(self):
+        router = IntentRouter(
+            DummyGroqService(
+                analysis_result={
+                    "intent": "PROF_SCHEDULE",
+                    "answer_source": "DATABASE",
+                    "confidence": 0.9,
+                    "standalone_query": "emploi du temps de la classe de Mohamed Ben Slima",
+                    "class_name": None,
+                    "professor_name": "Mohamed Ben Slima",
+                    "room_name": None,
+                    "day_hint": None,
+                    "time_hint": None,
+                    "university_topic": None,
+                }
+            ),
+            db=FakeDb(class_names=[], professor_names=["BEN SLIMA Mohamed"]),
+        )
+
+        decision = router.route("emploi de temps de mohamed ben slima", history=[], user_class=None, agent=DummyAgent())
+
+        self.assertEqual(decision.intent, IntentLabel.PROF_SCHEDULE.value)
+        self.assertEqual(decision.entities.professor_candidate, "BEN SLIMA Mohamed")
+        self.assertEqual(decision.full_question, "emploi du temps de BEN SLIMA Mohamed")
 
     def test_router_extracts_available_classes_from_database(self):
         router = IntentRouter(
@@ -463,6 +514,56 @@ class IntentRouterTests(unittest.TestCase):
         self.assertEqual(decision.intent, IntentLabel.CALENDAR.value)
         self.assertEqual(decision.execution_target, ExecutionTarget.SQL_AGENT.value)
         self.assertEqual(decision.entities.university_topic, "calendar")
+
+    def test_model_holidays_topic_overrides_university_site_to_calendar(self):
+        router = IntentRouter(
+            DummyGroqService(
+                analysis_result={
+                    "intent": "ENETCOM_INFO",
+                    "answer_source": "UNIVERSITY_SITE",
+                    "confidence": 0.9,
+                    "standalone_query": "Quand sont les vacances ?",
+                    "class_name": None,
+                    "professor_name": None,
+                    "room_name": None,
+                    "day_hint": None,
+                    "time_hint": None,
+                    "university_topic": "vacances",
+                }
+            )
+        )
+
+        decision = router.route("il ya tils des vacances ?", history=[], user_class=None, agent=DummyAgent())
+
+        self.assertEqual(decision.intent, IntentLabel.CALENDAR.value)
+        self.assertEqual(decision.execution_target, ExecutionTarget.SQL_AGENT.value)
+        self.assertEqual(decision.entities.university_topic, "calendar")
+        self.assertEqual(decision.full_question, "Quand sont les vacances ?")
+
+    def test_model_exam_calendar_topic_overrides_university_site_to_calendar(self):
+        router = IntentRouter(
+            DummyGroqService(
+                analysis_result={
+                    "intent": "ENETCOM_INFO",
+                    "answer_source": "UNIVERSITY_SITE",
+                    "confidence": 0.9,
+                    "standalone_query": "calendrier des examens ENET'Com",
+                    "class_name": None,
+                    "professor_name": None,
+                    "room_name": None,
+                    "day_hint": None,
+                    "time_hint": None,
+                    "university_topic": "exams",
+                }
+            )
+        )
+
+        decision = router.route("calendrier des examens", history=[], user_class=None, agent=DummyAgent())
+
+        self.assertEqual(decision.intent, IntentLabel.CALENDAR.value)
+        self.assertEqual(decision.execution_target, ExecutionTarget.SQL_AGENT.value)
+        self.assertEqual(decision.entities.university_topic, "calendar")
+        self.assertEqual(decision.full_question, "calendrier des examens ENET'Com")
 
     def test_absent_question_is_routed_to_university_service_without_model(self):
         decision = self.router.route("qui est absent ?", history=[], user_class=None, agent=DummyAgent())

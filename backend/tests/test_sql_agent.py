@@ -29,6 +29,12 @@ class SQLAgentWeekdayTests(unittest.TestCase):
             "Mercredi",
         )
 
+    def test_extract_requested_day_supports_tunisian_arabizi_tomorrow(self):
+        self.assertEqual(
+            self.agent._extract_requested_day("wa9tech na9ra ghoudwa ?", self.context),
+            "Vendredi",
+        )
+
     def test_enforce_requested_day_filter_rewrites_lowercase_day_predicate(self):
         sql = "SELECT * FROM seances s WHERE s.jour = 'lundi' AND s.periode_id = 4;"
         fixed = self.agent._enforce_requested_day_filter(
@@ -129,6 +135,16 @@ class SQLAgentWeekdayTests(unittest.TestCase):
         question = "dans quelle classe se trouve ben slima"
         self.assertEqual(self.agent._extract_prof_candidate(question), "ben slima")
         self.assertTrue(self.agent._is_prof_class_question(question))
+
+    def test_extract_prof_candidate_supports_three_word_professor_names(self):
+        question = "emploi de temps de mohamed ben slima"
+        self.assertEqual(self.agent._extract_prof_candidate(question), "mohamed ben slima")
+        self.assertEqual(self.agent._extract_schedule_prof_candidate(question), "mohamed ben slima")
+
+    def test_extract_prof_candidate_supports_professor_has_course_sentence_shape(self):
+        question = "KHALFALLAH Ali a cours vendredi"
+        self.assertEqual(self.agent._extract_prof_candidate(question), "KHALFALLAH Ali")
+        self.assertTrue(self.agent._is_prof_has_course_question(question))
 
     def test_extract_prof_candidate_ignores_trailing_time_words(self):
         question = "ou ce trouve mr ali khalfalah maintenant"

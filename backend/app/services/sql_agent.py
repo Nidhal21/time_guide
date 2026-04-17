@@ -166,9 +166,27 @@ class SQLAgent:
             "ferier": "ferie",
             "prochien": "prochain",
             "tempss": "temps",
+            "temp": "temps",
+            "etemps": "temps",
+            "emploid": "emploi",
             "lemploi": "emploi",
             "l emploi": "emploi",
             "ou ce trouve": "ou se trouve",
+            "ghodwa": "demain",
+            "ghoudwa": "demain",
+            "ghedwa": "demain",
+            "lyoum": "aujourd hui",
+            "tawa": "maintenant",
+            "taw": "maintenant",
+            "wa9tech": "quand",
+            "waqtech": "quand",
+            "win": "ou",
+            "na9ra": "j ai cours",
+            "naqra": "j ai cours",
+            "y9ari": "enseigne",
+            "yqari": "enseigne",
+            "ya9ra": "a cours",
+            "ensigne": "enseigne",
         }
         for source, target in typo_fixes.items():
             normalized = re.sub(rf"\b{re.escape(source)}\b", target, normalized)
@@ -2001,22 +2019,34 @@ class SQLAgent:
             candidate = _strip_trailing_time_words(match.group(2).strip())
             return candidate if self._is_valid_prof_candidate_text(candidate) else None
 
-        match = re.search(r"\bde\s+([A-Za-zÀ-ÿ'\-]+\s+[A-Za-zÀ-ÿ'\-]+)\b", q, re.IGNORECASE)
+        match = re.search(
+            r"\bde\s+(?!temps\b)([A-Za-zÀ-ÿ'\-]+(?:\s+[A-Za-zÀ-ÿ'\-]+){1,2})\b",
+            q,
+            re.IGNORECASE,
+        )
         if match:
             candidate = _strip_trailing_time_words(match.group(1).strip())
         else:
-            fallback_match = re.search(
-                r"(?:dans quelle classe se trouve|ou se trouve|pour quelle classe|quelle classe pour)\s+([A-Za-zÀ-ÿ'\-]+(?:\s+[A-Za-zÀ-ÿ'\-]+){0,2})$",
+            action_match = re.search(
+                r"\b([A-Za-zÀ-ÿ'\-]+(?:\s+[A-Za-zÀ-ÿ'\-]+){1,2})\s+(?:a\s+cours|fait|enseigne)\b",
                 q,
                 re.IGNORECASE,
             )
-            if fallback_match:
-                candidate = _strip_trailing_time_words(fallback_match.group(1).strip())
+            if action_match:
+                candidate = _strip_trailing_time_words(action_match.group(1).strip())
             else:
-                bare_match = re.fullmatch(r"\s*([A-Za-zÀ-ÿ'\-]+(?:\s+[A-Za-zÀ-ÿ'\-]+){1,2})\s*", q)
-                if not bare_match or self._extract_class_candidate(q):
-                    return None
-                candidate = _strip_trailing_time_words(bare_match.group(1).strip())
+                fallback_match = re.search(
+                    r"(?:dans quelle classe se trouve|ou se trouve|pour quelle classe|quelle classe pour)\s+([A-Za-zÀ-ÿ'\-]+(?:\s+[A-Za-zÀ-ÿ'\-]+){0,2})$",
+                    q,
+                    re.IGNORECASE,
+                )
+                if fallback_match:
+                    candidate = _strip_trailing_time_words(fallback_match.group(1).strip())
+                else:
+                    bare_match = re.fullmatch(r"\s*([A-Za-zÀ-ÿ'\-]+(?:\s+[A-Za-zÀ-ÿ'\-]+){1,2})\s*", q)
+                    if not bare_match or self._extract_class_candidate(q):
+                        return None
+                    candidate = _strip_trailing_time_words(bare_match.group(1).strip())
 
         if not self._is_valid_prof_candidate_text(candidate):
             return None

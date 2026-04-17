@@ -170,6 +170,9 @@ class IntentRouter:
             "licence",
             "doctorat",
             "contact",
+            "directeur",
+            "direction",
+            "directrice",
         ),
         "calendar": (
             "vacance",
@@ -478,6 +481,28 @@ class IntentRouter:
             merged_entities.room_candidate = entities.room_candidate
             confidence = min(confidence, 0.45)
 
+        calendar_topics = {
+            "calendar",
+            "holidays",
+            "holiday",
+            "jour ferie",
+            "jours feries",
+            "vacances",
+            "exam",
+            "exams",
+            "examen",
+            "examens",
+            "revision",
+            "revisions",
+        }
+        normalized_topic = self._normalize_text(merged_entities.university_topic or "")
+        if normalized_topic in calendar_topics:
+            merged_entities.university_topic = "calendar"
+            if answer_source == "UNIVERSITY_SITE":
+                answer_source = "DATABASE"
+            if intent_value == "ENETCOM_INFO":
+                intent_value = "CALENDAR"
+
         mapping = {
             "GREETING": (IntentLabel.CHAT_SMALLTALK.value, ExecutionTarget.SMALLTALK.value),
             "CLASS_SCHEDULE": (IntentLabel.CLASS_SCHEDULE.value, ExecutionTarget.SQL_AGENT.value),
@@ -505,6 +530,9 @@ class IntentRouter:
             mapped = (IntentLabel.CHAT_SMALLTALK.value, ExecutionTarget.SMALLTALK.value)
         elif answer_source == "OUT_OF_SCOPE":
             mapped = (IntentLabel.OUT_OF_SCOPE.value, ExecutionTarget.OUT_OF_SCOPE.value)
+
+        if merged_entities.university_topic == "calendar":
+            mapped = (IntentLabel.CALENDAR.value, ExecutionTarget.SQL_AGENT.value)
 
         if mapped[0] in {IntentLabel.CHAT_SMALLTALK.value, IntentLabel.OUT_OF_SCOPE.value}:
             merged_entities = IntentEntities(
@@ -553,6 +581,16 @@ class IntentRouter:
         if mapped[0] in {IntentLabel.CLASS_SCHEDULE.value, IntentLabel.CLASS_LOCATION.value} and not merged_entities.class_candidate:
             confidence = min(confidence, 0.45)
 
+        canonical_full_question = standalone_query
+        if mapped[1] == ExecutionTarget.SQL_AGENT.value:
+            canonical_full_question = self._augment_question(
+                standalone_query,
+                mapped[0],
+                merged_entities,
+                state,
+                None,
+            )
+
         return IntentDecision(
             intent=mapped[0],
             execution_target=mapped[1],
@@ -561,7 +599,7 @@ class IntentRouter:
             normalized_message=normalized_message,
             entities=merged_entities,
             state=state,
-            full_question=standalone_query if mapped[1] in {ExecutionTarget.SQL_AGENT.value, ExecutionTarget.UNIVERSITY_SERVICE.value} else None,
+            full_question=canonical_full_question if mapped[1] in {ExecutionTarget.SQL_AGENT.value, ExecutionTarget.UNIVERSITY_SERVICE.value} else None,
         )
 
     def _sanitize_model_entity_value(self, value: Any) -> Optional[str]:
@@ -666,7 +704,7 @@ class IntentRouter:
         state = decision.state
         entities = decision.entities
         base_question = decision.full_question or ""
-        if decision.source == "model_analysis" and base_question:
+        if decision.source == "model_analysis" and decision.execution_target == ExecutionTarget.UNIVERSITY_SERVICE.value and base_question:
             full_question = base_question
         else:
             full_question = self._augment_question(
@@ -1750,11 +1788,35 @@ class IntentRouter:
             "feriee": "ferie",
             "feries": "ferie",
             "ferier": "ferie",
+            "vacance": "vacances",
+            "holydays": "holidays",
             "prochien": "prochain",
             "tempss": "temps",
+            "temp": "temps",
+            "etemps": "temps",
+            "emploid": "emploi",
+            "emploid": "emploi",
             "lemploi": "emploi",
             "l emploi": "emploi",
             "ou ce trouve": "ou se trouve",
+            "ensigne": "enseigne",
+            "aujourdhui": "aujourd hui",
+            "il ya": "il y a",
+            "tils": "t il",
+            "ghodwa": "demain",
+            "ghoudwa": "demain",
+            "ghedwa": "demain",
+            "lyoum": "aujourd hui",
+            "tawa": "maintenant",
+            "taw": "maintenant",
+            "wa9tech": "quand",
+            "waqtech": "quand",
+            "win": "ou",
+            "na9ra": "j ai cours",
+            "naqra": "j ai cours",
+            "y9ari": "enseigne",
+            "yqari": "enseigne",
+            "ya9ra": "a cours",
         }
         for source, target in typo_fixes.items():
             normalized = re.sub(rf"\b{re.escape(source)}\b", target, normalized)

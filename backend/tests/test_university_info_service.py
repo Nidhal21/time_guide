@@ -58,6 +58,7 @@ class UniversityInfoServiceTests(unittest.TestCase):
         with patch.object(self.service._session, "get", return_value=fake_response):
             response = self.service.answer_question("est ce qu il y a des absences des profs")
 
+        self.assertIn("Je ne peux pas identifier les enseignants absents", response)
         self.assertIn("Espace Extranet", response)
         self.assertIn(self.service.ABSENCES_URL, response)
 
@@ -92,6 +93,26 @@ class UniversityInfoServiceTests(unittest.TestCase):
 
         self.assertIn("BEN SLIMA Mounir", response)
         self.assertIn("TRABELSI Nesrine", response)
+        self.assertIn(self.service.ABSENCES_URL, response)
+
+    def test_absence_question_extracts_absent_teachers_from_card_layout(self):
+        fake_response = SimpleNamespace(
+            url=self.service.ABSENCES_URL,
+            text="""
+                <html><body>
+                    <div class="absence-card">
+                        <a href="#">Nessrine Trabelsi</a>
+                        <span>il y a 1 jour</span>
+                        <div>Date : jeudi 16 avril 2026, 08:15 - samedi 18 avril 2026, 13:15</div>
+                    </div>
+                </body></html>
+            """,
+        )
+
+        with patch.object(self.service._session, "get", return_value=fake_response):
+            response = self.service.answer_question("avis dabsence")
+
+        self.assertIn("Nessrine Trabelsi", response)
         self.assertIn(self.service.ABSENCES_URL, response)
 
     def test_absence_question_falls_back_to_page_excerpt_when_detailed_extraction_fails(self):

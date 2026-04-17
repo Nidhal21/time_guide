@@ -574,6 +574,56 @@ class ChatApiWeekdaySmokeTests(unittest.TestCase):
         self.assertIn("je vais bien", body)
         self.assertIn("merci", body)
 
+    def test_tunisian_greetings_are_recognized_as_greetings(self):
+        for message in ("aaslema", "sbah khir", "ahla"):
+            response = self.client.post(
+                "/api/chat",
+                json={
+                    "message": message,
+                    "user_role": "student",
+                    "history": [],
+                },
+            )
+
+            self.assertEqual(response.status_code, 200)
+            body = response.json()["response"].lower()
+            self.assertIn("bonjour", body)
+            self.assertIn("emploi du temps", body)
+
+    def test_tunisian_thanks_is_recognized_as_smalltalk(self):
+        response = self.client.post(
+            "/api/chat",
+            json={
+                "message": "aaychek",
+                "user_role": "student",
+                "history": [],
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        body = response.json()["response"].lower()
+        self.assertTrue("emploi du temps" in body or "avec plaisir" in body or "absences" in body)
+
+    def test_tunisian_director_question_goes_to_university_service(self):
+        with patch.object(
+            university_info_service,
+            "answer_question",
+            return_value="Le directeur de l'ENET'Com est Chokri ABDELMOULA.",
+        ) as answer_mock, patch("app.routes.chat.SQLAgent.process_routed_question") as process_mock:
+            response = self.client.post(
+                "/api/chat",
+                json={
+                    "message": "chesmou directeur",
+                    "user_role": "student",
+                    "history": [],
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("directeur", response.json()["response"].lower())
+        answer_mock.assert_called_once_with("chesmou directeur")
+        process_mock.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

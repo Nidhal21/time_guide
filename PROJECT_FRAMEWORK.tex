@@ -1,0 +1,342 @@
+\chapter{Project Framework}
+\begin{spacing}{1.2}
+\minitoc
+\thispagestyle{MyStyle}
+\end{spacing}
+\newpage
+
+\section{Introduction}
+In any academic institution, access to timetable information constitutes a daily and essential need for students, teachers, and administrative staff. Class schedules, room assignments, teacher availability, and academic calendar events are all pieces of information that must be consulted quickly and accurately. However, in many universities, including ENET'Com, this information is generally distributed through static Excel files or administrative documents that are not designed for intelligent interaction. As a result, users are often required to manually search through multiple files in order to find a simple piece of information.
+
+In this context, the present chapter introduces the general framework of the \textbf{Time Guide AI} project, previously referred to as the Enetbot project. More specifically, it explains the academic and technical environment in which the project was developed, highlights the main problem addressed, and presents the proposed solution. In addition, it defines the objectives, identifies the stakeholders, and outlines the methodological and technological choices adopted during the realization of the system. Therefore, this chapter serves as the foundation for understanding both the relevance of the project and the design decisions discussed in the following chapters.
+
+\section{Context}
+The digital transformation of higher education has considerably changed the way universities manage and disseminate information. Today, students and teachers expect fast, intuitive, and flexible access to academic services. Among these services, timetable consultation remains one of the most frequent operational tasks, since it directly affects attendance, room occupation, teaching organization, and administrative coordination.
+
+At National School of Electronics and Telecommunications of Sfax (ENET'Com), timetable-related information is mainly maintained in Excel workbooks and shared through conventional channels. Although these documents are useful for publication and archiving purposes, they remain limited in terms of usability. Indeed, they are not intended for dynamic search, contextual filtering, or natural language interaction. Consequently, users must manually inspect rows, columns, time slots, and worksheet tabs in order to locate the required information. This process becomes even more complex when several categories of data must be consulted simultaneously, such as class schedules, teacher timetables, room allocations, and academic calendar events.
+
+Furthermore, the institution also provides general information through its official website, including departments, study programs, contact details, and internship or PFE information. Since such information is external to timetable spreadsheets, the need emerges for a unified system capable of combining structured academic data and official institutional information within a single intelligent assistant.
+
+\section{Problem Statement}
+The main problem addressed in this project is the absence of a centralized, intelligent, and user-friendly system for querying timetable and institutional information at ENET'Com. Existing tools provide access to data in a static form, but they do not support interactive consultation or natural language understanding.
+
+This situation leads to several limitations. First, access to information is often slow and inconvenient, especially when users need only one specific detail, such as the location of a teacher, the availability of a room, or the timetable of a particular class. Second, the manual consultation of spreadsheets increases the risk of misunderstanding or overlooking important information. Third, the absence of a conversational interface reduces accessibility for non-technical users, who may not be familiar with database systems or complex filtering mechanisms.
+
+Therefore, the project seeks to answer the following question: \textit{how can timetable and institutional information be transformed from static academic resources into an intelligent, conversational, and reliable assistant adapted to the daily needs of university users?}
+
+\section{Proposed Solution}
+In order to overcome the previously identified limitations, this project proposes the development of \textbf{Time Guide AI}, an intelligent conversational assistant dedicated to timetable consultation and institutional information access at ENET'Com. The idea is to provide users with a web-based platform through which they can ask questions in natural language and receive clear, grounded, and context-aware answers.
+
+The proposed solution is based on a hybrid architecture combining deterministic logic, structured database querying, and selective AI assistance. On the one hand, timetable data is imported from Excel workbooks, validated, and stored in a structured PostgreSQL database. On the other hand, institutional information can be retrieved from the official ENET'Com website when the question concerns general academic services rather than timetable data. Between these two sources, an intelligent processing layer is responsible for classifying the request (through \textit{intent routing}), extracting relevant entities, selecting the appropriate execution path, and formatting the final response.
+
+Moreover, the system integrates an administration dashboard that allows authorized users to upload and validate timetable workbooks before importing them into the database. The import process includes automatic detection of workbook categories (\textit{student\_s1, student\_s2, teachers\_s1, teachers\_s2, rooms\_s1, rooms\_s2, calendar}), verification of semester coherence, and status reporting. In this way, the solution does not only answer user queries, but also ensures maintainability, traceability, and data consistency over time.
+
+\section{Objectives}
+The principal objective of this project is to design and implement an intelligent university assistant that simplifies access to timetable and institutional information through natural language interaction, supporting multiple languages and dialects.
+
+More specifically, the project aims to achieve the following goals:
+\begin{itemize}
+    \item provide a modern conversational interface accessible to students, teachers, and administrators through a web browser;
+    \item allow users to query class schedules, teacher locations, room availability, and academic calendar events using natural language in French, Arabic, and Tunisian dialect with typo tolerance;
+    \item centralize timetable data in a structured relational database (PostgreSQL) in order to improve reliability and query precision;
+    \item integrate official ENET'Com information (departments, programs, contact details) into the assistant so that users can ask both timetable and institutional questions;
+    \item develop an administration interface for importing Excel timetable files with automatic category detection, validation mechanisms, and import status monitoring;
+    \item ensure data consistency by controlling workbook categories, semester coherence, timetable versions, and active status flags;
+    \item combine deterministic logic (routing, SQL generation) and AI-based assistance (Groq API) in order to balance precision, flexibility, and response quality;
+    \item track academic calendar events (holidays, exam periods, revision sessions) for contextual awareness in user queries.
+\end{itemize}
+
+Accordingly, the project is not limited to building a chatbot interface. Instead, it aims to establish a complete academic information system in which data ingestion, query processing, response generation, and administrative oversight are all handled in a coherent and secure manner.
+
+\section{Stakeholders and Actors}
+Several stakeholders are directly concerned by the Time Guide AI platform, since the project addresses real operational needs within the university environment.
+
+First, \textbf{students} represent the primary end users of the system. They need to consult their class timetables, identify classrooms, know which teacher is assigned to a course, verify whether holidays or exams affect their schedule, and access general information about departments and programs.
+
+Second, \textbf{teachers} also benefit from the platform, as they can use it to check their teaching sessions, identify their current or upcoming classrooms, verify the classes they are expected to teach, and manage multiple timetable versions across different semesters.
+
+Third, \textbf{administrators} play a crucial role in maintaining the system. Through the administration dashboard, they are responsible for uploading timetable workbooks, validating data categories, verifying semester consistency, and ensuring that only coherent and updated data are imported into the database.
+
+In addition, the \textbf{institution itself} benefits from the deployment of such a system, since it improves the accessibility of academic information and reduces dependence on manual document consultation and phone inquiries.
+
+Finally, the \textbf{official ENET'Com website} can be considered as an external information source. Although it is not a human actor, it participates in the overall system by providing grounded institutional content (departments, programs, contacts) used to answer certain categories of questions.
+
+\section{Functional Scope}
+The functional scope of the project can be divided into two main spaces: the user-oriented conversational space and the administration space.
+
+\subsection{User Functionality}
+From the user perspective, the platform allows authenticated users to access the chat interface and ask different categories of questions. The system supports the following intent categories:
+
+\begin{itemize}
+    \item \textbf{Class Schedule Queries}: Questions about the complete timetable for a given class, including all sessions, teachers, rooms, and time slots.
+    \item \textbf{Teacher-Related Queries}: Questions about a specific teacher's schedule, current location, assigned classes, and current course.
+    \item \textbf{Room-Related Queries}: Questions about room availability, current occupancy, scheduled sessions, and room specifications.
+    \item \textbf{Academic Calendar Queries}: Questions about holidays, exam periods, revision sessions, and academic deadlines.
+    \item \textbf{Institutional Information Requests}: Questions about ENET'Com departments, programs, contact details, and general university services.
+    \item \textbf{Conversational Markers}: Greetings, thanks, help requests, and out-of-scope inquiries.
+\end{itemize}
+
+The system maintains conversation state to support context-aware follow-up questions and clarifications when necessary.
+
+\subsection{Administrator Functionality}
+From the administrator perspective, the platform includes protected functionalities for workbook upload and data management. More precisely, administrators can submit Excel files corresponding to the following categories:
+
+\begin{itemize}
+    \item Student timetables for Semester 1 (\texttt{student\_s1})
+    \item Student timetables for Semester 2 (\texttt{student\_s2})
+    \item Teacher timetables for Semester 1 (\texttt{teachers\_s1})
+    \item Teacher timetables for Semester 2 (\texttt{teachers\_s2})
+    \item Room schedules for Semester 1 (\texttt{rooms\_s1})
+    \item Room schedules for Semester 2 (\texttt{rooms\_s2})
+    \item Academic calendar events (\texttt{calendar})
+\end{itemize}
+
+Before import, the system verifies that the uploaded workbook matches the correct category and semester through automatic detection heuristics. Afterward, the import status and results can be reviewed from the dashboard, including success counts, error logs, and data consistency warnings.
+
+Consequently, the functional perimeter of the project covers not only conversational access to information, but also the full data update cycle required to keep the assistant operational in a real academic environment.
+
+\section{Non-Functional Requirements}
+Beyond its functional capabilities, Time Guide AI must also satisfy several non-functional requirements that are essential for a professional academic application.
+
+First, \textbf{reliability} is a major requirement. Since timetable queries concern operational academic decisions, the system must favor controlled database access and grounded responses rather than uncontrolled text generation. The intent routing system prioritizes SQL-based queries over purely generative responses.
+
+Second, \textbf{security} is necessary to protect user accounts and privileged operations. Authentication through password hashing, session management, and role-based access control (RBAC) are therefore indispensable. Admin operations are protected by authentication checks.
+
+Third, \textbf{maintainability} must be ensured through a modular architecture in which frontend components, backend routes, services, and database models remain clearly separated. The project uses a three-tier architecture with distinct layers for API routes, business logic services, and data models.
+
+Fourth, \textbf{usability} is also important, because the system targets non-technical users who need a simple and intuitive interface. The chat interface follows modern UX patterns with clear message formatting and visual feedback.
+
+In addition, \textbf{traceability} is required in order to manage multiple timetable versions and guarantee that only the active data is used for answering queries. The database maintains version history through \texttt{timetable\_versions} and \texttt{active} flags.
+
+Moreover, \textbf{multilingual support} is necessary because the target audience includes French, Arabic, and Tunisian dialect speakers. The intent router includes language-specific keyword recognition and typo tolerance.
+
+Finally, \textbf{scalability} must be taken into account so that the system can later evolve by supporting new intents, new workbook formats, or additional university services.
+
+\section{Methodology}
+The development of Time Guide AI follows an iterative and progressive methodology. This choice is particularly suitable for a full-stack academic project, because it allows the system to evolve step by step while incorporating feedback and improving reliability.
+
+The process began with the analysis of user needs and the identification of the main use cases related to timetable consultation and institutional information access. Next, the system architecture was designed by separating the frontend (React/Vite), backend (FastAPI), database (PostgreSQL), and intelligent processing layers. After that, the implementation phase focused on the development of:
+
+\begin{enumerate}
+    \item The conversational interface with React components and real-time chat state management;
+    \item The FastAPI backend with modular route handlers for authentication, chat, and admin operations;
+    \item The database schema with models for academic entities (classes, teachers, rooms, sessions);
+    \item The Excel import pipeline for data validation, category detection, and batch insertion;
+    \item The intent routing system for classifying user queries and selecting execution paths;
+    \item The SQL agent for generating context-aware database queries;
+    \item The university information service for web scraping and institutional data retrieval;
+    \item The Groq API integration for entity extraction, intent classification, and response generation.
+\end{enumerate}
+
+Finally, testing and validation were carried out in order to verify the coherence of the workflows and the correctness of the generated responses.
+
+It is also important to note that the project architecture evolved during development. Initial experimentation explored more direct model-based solutions relying heavily on LLM generation, while the current implementation adopts a hybrid strategy that combines:
+
+\begin{itemize}
+    \item \textbf{Deterministic intent routing}: Rule-based classification based on keyword recognition and conversation history;
+    \item \textbf{Structured database querying}: SQL generation and execution through the SQL agent;
+    \item \textbf{Selective AI assistance}: Groq API used for entity extraction, classification clarification, and response formatting rather than unrestricted generation.
+\end{itemize}
+
+This evolution reflects a move toward a more robust, maintainable, and reliable engineering approach that prioritizes answer accuracy over generation flexibility.
+
+\section{Tools and Technologies}
+
+The realization of Time Guide AI relies on a set of modern and complementary technologies, each of which fulfills a specific role in the system. The technology stack has been carefully selected to balance ease of development, maintainability, performance, and cost-effectiveness.
+
+\subsection{Frontend Architecture}
+The frontend is implemented using \textbf{React 18} and \textbf{TypeScript}. React provides a component-based approach for building dynamic and interactive user interfaces, while TypeScript improves code reliability through static typing and early error detection. The build process uses \textbf{Vite}, a modern bundler that provides fast development server startup and optimized production builds.
+
+For styling, \textbf{Tailwind CSS} is used to design responsive and visually consistent interfaces through a utility-first approach. For pre-built UI components, the project leverages \textbf{shadcn/ui}, which wraps Radix UI primitives with Tailwind CSS styling to ensure accessibility and consistency.
+
+Additional frontend libraries include:
+
+\begin{itemize}
+    \item \textbf{React Router DOM}: Client-side routing for navigation between pages (Index, Chat, Auth, Admin);
+    \item \textbf{TanStack Query}: Server state management for API calls and caching;
+    \item \textbf{Sonner}: Toast notification system for user feedback;
+    \item \textbf{Framer Motion}: Animation library for smooth UI transitions;
+    \item \textbf{Lucide React}: Icon library for visual clarity;
+    \item \textbf{Vitest}: Unit testing framework for React components.
+\end{itemize}
+
+The frontend is organized into five main directories:
+
+\begin{itemize}
+    \item \texttt{src/pages/}: Page-level components (Index, Chat, Auth, Admin, NotFound);
+    \item \texttt{src/components/}: Reusable UI components, including chat interface, auth guards, and UI primitives;
+    \item \texttt{src/contexts/}: React context for global state management (AuthContext);
+    \item \texttt{src/hooks/}: Custom React hooks (use-mobile, use-toast);
+    \item \texttt{src/lib/}: Utility functions and helpers;
+    \item \texttt{src/test/}: Unit tests and test setup.
+\end{itemize}
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.6\linewidth]{images/frontend_tech.png}
+    \caption{Frontend technology stack: React 18, TypeScript, Vite, Tailwind CSS, and shadcn/ui}
+    \label{fig:frontend-tech}
+\end{figure}
+
+\subsection{Backend Architecture}
+The backend is developed using \textbf{FastAPI}, a modern Python framework dedicated to the creation of high-performance RESTful APIs. FastAPI is particularly suitable for this project because it:
+
+\begin{itemize}
+    \item Supports asynchronous request handling through Uvicorn (ASGI server);
+    \item Provides automatic OpenAPI documentation generation;
+    \item Includes built-in data validation through Pydantic models;
+    \item Enables type hints and IDE autocomplete through Python type annotations.
+\end{itemize}
+
+The backend is organized into three main layers:
+
+\begin{enumerate}
+    \item \textbf{Routes Layer} (\texttt{backend/app/routes/}): Defines API endpoints for authentication, chat, and admin operations;
+    \item \textbf{Services Layer} (\texttt{backend/app/services/}): Implements business logic, including intent routing, SQL generation, Excel parsing, and external service integration;
+    \item \textbf{Models Layer} (\texttt{backend/app/models/}): Defines database models and configuration.
+\end{enumerate}
+
+Key backend services include:
+
+\begin{itemize}
+    \item \textbf{Auth Service}: User registration, login, password hashing, and session management;
+    \item \textbf{Intent Router}: Classifies user queries into intent categories and routes to appropriate execution paths;
+    \item \textbf{SQL Agent}: Generates and executes SQL queries based on user intent and entity extraction;
+    \item \textbf{Groq Service}: Manages communication with the Groq API for intent classification, entity extraction, and response generation;
+    \item \textbf{Excel Parser}: Parses Excel workbooks and extracts timetable data;
+    \item \textbf{Admin Import Service}: Validates uploaded workbooks, detects categories, and manages database import operations;
+    \item \textbf{University Info Service}: Scrapes and serves institutional information from the ENET'Com website.
+\end{itemize}
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.7\linewidth]{images/backend_arch.png}
+    \caption{FastAPI backend architecture with modular service layers}
+    \label{fig:backend-arch}
+\end{figure}
+
+\subsection{Database Design}
+The system uses \textbf{PostgreSQL 14+} as its relational database management system. This choice is justified by the need to manage structured academic entities with clear relationships, including:
+
+\begin{itemize}
+    \item \texttt{classes}: Academic class entities with department and semester assignments;
+    \item \texttt{professeurs}: Teacher entities with name, grade, and specialization;
+    \item \texttt{matieres}: Course subjects with codes;
+    \item \texttt{salles}: Classroom entities with type and capacity;
+    \item \texttt{seances}: Timetable sessions linking classes, teachers, rooms, and time slots;
+    \item \texttt{emplois\_versions}: Timetable version tracking with active status;
+    \item \texttt{periodes}: Academic periods (P1, P2) within semesters;
+    \item \texttt{vacances\_jours\_feries}: Academic calendar events (holidays, exams, revision periods);
+    \item \texttt{users}: User accounts with authentication credentials (hashed passwords);
+    \item \texttt{emplois\_enseignants\_seances}: Denormalized teacher timetable cache for efficient queries.
+\end{itemize}
+
+For database interaction, \textbf{SQLAlchemy} is used as the ORM layer to facilitate object-relational mapping between Python objects and database tables. \textbf{Psycopg} serves as the PostgreSQL adapter for Python, ensuring reliable connection management and query execution.
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=0.8\linewidth]{images/database_schema.png}
+    \caption{PostgreSQL database schema showing academic entities and relationships}
+    \label{fig:database-schema}
+\end{figure}
+
+\subsection{Data Processing Pipeline}
+Since timetable information initially exists in Excel format, data processing is a central part of the project. In this regard, \textbf{Pandas} and \textbf{OpenPyXL} are used to:
+
+\begin{itemize}
+    \item Read Excel workbooks with sheet-level structure awareness;
+    \item Extract, clean, and transform workbook content;
+    \item Detect and validate data categories (student\_s1, teachers\_s1, rooms\_s1, etc.);
+    \item Normalize text (handling typos, case inconsistency, encoding issues);
+    \item Batch insert cleaned data into the database.
+\end{itemize}
+
+Additionally, the Excel parser includes validation logic to detect:
+
+\begin{itemize}
+    \item Workbook category mismatches;
+    \item Semester inconsistencies (mixing S1 and S2 data);
+    \item Missing required columns;
+    \item Duplicate or conflicting entries;
+    \item Mojibake and encoding errors.
+\end{itemize}
+
+These tools are essential for bridging the gap between static spreadsheet data and structured conversational querying.
+
+\subsection{Natural Language Processing and Intelligent Services}
+To support natural language interaction, the project integrates AI-based services through the \textbf{Groq API}, a cloud-based LLM service. The specific model used is \texttt{llama-3.3-70b-versatile}, selected for its balance of speed, accuracy, and capability across multiple languages.
+
+The Groq integration is used for tasks such as:
+
+\begin{itemize}
+    \item \textbf{Request Classification}: Initial intent classification when deterministic rules are insufficient;
+    \item \textbf{Entity Extraction}: Identifying class names, teacher names, room numbers, and temporal markers;
+    \item \textbf{Clarification Generation}: Formulating disambiguation questions when user input is ambiguous;
+    \item \textbf{Response Formatting}: Transforming raw query results into user-friendly natural language responses.
+\end{itemize}
+
+However, the system does not rely exclusively on generative AI. Instead, it combines model assistance with deterministic routing and controlled database logic in order to:
+
+\begin{itemize}
+    \item Improve answer precision by grounding responses in actual database queries;
+    \item Reduce response latency by avoiding unnecessary API calls;
+    \item Minimize hallucination risks through structured SQL-based queries rather than free-form generation;
+    \item Ensure cost-effectiveness by limiting LLM API usage to classification and formatting tasks.
+\end{itemize}
+
+The intent router incorporates a hierarchy of decision paths:
+
+\begin{enumerate}
+    \item \textbf{Conversation Markers}: Greetings and smalltalk (handled locally);
+    \item \textbf{Deterministic Routing}: Keyword-based and history-based classification for common intents;
+    \item \textbf{Groq Classification}: LLM-based intent classification for ambiguous queries;
+    \item \textbf{SQL Agent Execution}: Generating and executing parameterized SQL queries;
+    \item \textbf{University Service}: Serving institutional information from scraped data.
+\end{enumerate}
+
+\subsection{Additional Technologies}
+Supporting libraries and tools include:
+
+\begin{itemize}
+    \item \textbf{Pydantic}: Data validation and serialization for API requests and responses;
+    \item \textbf{Python Dotenv}: Environment variable management for API keys and configuration;
+    \item \textbf{Requests}: HTTP client library for web scraping and external API calls;
+    \item \textbf{CORS Middleware}: Cross-Origin Resource Sharing configuration for frontend-backend communication;
+    \item \textbf{Bun}: Package manager for the frontend (alternative to npm/yarn);
+    \item \textbf{Docker Compose}: Container orchestration for local database deployment (optional).
+\end{itemize}
+
+\section{System Architecture Overview}
+
+The overall architecture of Time Guide AI follows a three-tier design pattern:
+
+\begin{figure}[H]
+    \centering
+    \includegraphics[width=1\linewidth]{images/system_architecture.png}
+    \caption{Three-tier system architecture: presentation layer (React frontend), application layer (FastAPI backend), and data layer (PostgreSQL database)}
+    \label{fig:system-architecture}
+\end{figure}
+
+The data flow for a typical user query is as follows:
+
+\begin{enumerate}
+    \item User inputs a question in the Chat interface;
+    \item Frontend sends HTTP POST request to \texttt{/api/chat} endpoint;
+    \item Backend Intent Router classifies the query into an intent category;
+    \item Based on intent, the system selects an execution path:
+    \begin{itemize}
+        \item \textit{SQL Agent Path}: Generate SQL query, execute against database, return results;
+        \item \textit{University Service Path}: Query scraped institutional data;
+        \item \textit{Smalltalk Path}: Generate conversational response via Groq;
+        \item \textit{Clarification Path}: Request additional information from user.
+    \end{itemize}
+    \item Backend formats response and returns ChatResponse object;
+    \item Frontend displays response in chat interface with appropriate formatting.
+\end{enumerate}
+
+\section{Conclusion}
+This chapter has presented the general framework of the Time Guide AI project by introducing its context, problem statement, proposed solution, objectives, stakeholders, methodology, and technological environment. Through this analysis, it becomes clear that the project responds to a real academic need and that its design is grounded in both practical and technical considerations.
+
+The hybrid approach combining deterministic logic, structured database queries, and selective AI assistance reflects a pragmatic engineering decision that prioritizes reliability and maintainability over pure generative flexibility. The modular architecture enables independent evolution of frontend, backend, and database layers while maintaining clear separation of concerns.
+
+Furthermore, this chapter establishes the basis for the remainder of the report. Indeed, once the project framework has been clarified, it becomes possible to move toward a deeper theoretical and conceptual analysis. For this reason, the next chapter will focus on the literature foundations and the key concepts that support the design of an intelligent conversational university assistant.
